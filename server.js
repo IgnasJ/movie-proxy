@@ -438,18 +438,36 @@ app.get('/play', async (req, res) => {
   const { post, type, nume } = req.query;
   const title = (req.query.t || 'Grotuvas').toString();
   const back = (req.query.back || '/').toString();
-  const mode = req.query.mode === 'raw' ? 'raw' : 'clean';
+  // auto (default): keep the source wrapper for referer-protected players, embed
+  // direct players as-is. clean: strip the source ad-wrapper (may break players
+  // that require the source referer). raw: force the source wrapper.
+  const mode = ['clean', 'raw'].includes(req.query.mode) ? req.query.mode : 'auto';
   if (!post || !type || !nume) return res.redirect('/');
   try {
     const embed = await resolveEmbed(post, type, nume);
     if (!embed) throw new Error('Serveris negrąžino grotuvo nuorodos');
     let src = embed.startsWith('http') ? embed : SOURCE + embed;
-    let cleaned = false;
-    if (mode === 'clean' && new URL(src).host === new URL(SOURCE).host) {
+
+    // A player served from the source domain (e.g. p2.php) loads the real player
+    // itself, so the player's referrer becomes the source — which referer-checking
+    // players require. Extracting it ("clean") moves that load onto our domain and
+    // breaks the check, so we only extract when explicitly asked.
+    const onSource = new URL(src).host === new URL(SOURCE).host;
+    let usingWrapper = onSource;
+    if (onSource && mode === 'clean') {
       const clean = await resolveClean(src);
-      if (clean) { src = clean; cleaned = true; }
+      if (clean) { src = clean; usingWrapper = false; }
     }
-    const switchQs = new URLSearchParams({ post, type, nume, t: title, back, mode: mode === 'raw' ? 'clean' : 'raw' }).toString();
+
+    let toggle = '';
+    if (onSource) {
+      const nextMode = usingWrapper ? 'clean' : 'raw';
+      const label = usingWrapper ? 'Bandyti be reklamų' : 'Jei neveikia, spausk čia';
+      const qs = new URLSearchParams({ post, type, nume, t: title, back, mode: nextMode }).toString();
+      toggle = `<a class="btn alt" href="/play?${esc(qs)}">${label}</a>`;
+    }
+    const statusNote = usingWrapper ? ' (su reklama)' : '';
+
     res.send(`<!DOCTYPE html>
 <html lang="lt">
 <head>
@@ -462,8 +480,8 @@ app.get('/play', async (req, res) => {
 <body class="playerpage">
 <div class="playerbar">
   <a class="btn" href="${esc(back)}" autofocus>‹ Grįžti</a>
-  <span class="playertitle">${esc(title)}${cleaned ? '' : ' (originalus režimas)'}</span>
-  <a class="btn alt" href="/play?${esc(switchQs)}">${mode === 'raw' ? 'Švarus režimas' : 'Jei neveikia, spausk čia'}</a>
+  <span class="playertitle">${esc(title)}${statusNote}</span>
+  ${toggle}
 </div>
 <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
 <script src="/tv.js"></script>
