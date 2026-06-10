@@ -185,6 +185,20 @@ function parseServerLi($, li) {
   };
 }
 
+// Put DOOD and STREAMT servers first, then everything else in original order.
+function sortServers(servers) {
+  const rank = (s) => {
+    const t = (s.tag || '').toUpperCase();
+    if (t.includes('DOOD')) return 0;
+    if (t.includes('STREAMT')) return 1;
+    return 2;
+  };
+  return servers
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i)
+    .map((x) => x.s);
+}
+
 function parseDetail(html) {
   const $ = cheerio.load(html);
   const d = {};
@@ -214,16 +228,16 @@ function parseDetail(html) {
     d.kind = 'series';
     d.episodes = epLis.map((_, li) => {
       const $li = $(li);
-      const servers = $li.next('.collapse').find('li.dooplay_player_option')
+      const servers = sortServers($li.next('.collapse').find('li.dooplay_player_option')
         .map((__, s) => parseServerLi($, s)).get()
-        .filter(s => s.post && s.nume);
+        .filter(s => s.post && s.nume));
       return { label: $li.find('.title').first().text().trim(), servers };
     }).get().filter(e => e.servers.length);
   } else {
     d.kind = 'movie';
-    d.servers = $('#playeroptions li.dooplay_player_option')
+    d.servers = sortServers($('#playeroptions li.dooplay_player_option')
       .map((_, s) => parseServerLi($, s)).get()
-      .filter(s => s.post && s.nume);
+      .filter(s => s.post && s.nume));
   }
   return d;
 }
@@ -438,12 +452,6 @@ app.get('/play', async (req, res) => {
   const { post, type, nume } = req.query;
   const title = (req.query.t || 'Grotuvas').toString();
   const back = (req.query.back || '/').toString();
-  // auto (default): extract the real player so the browser loads a trusted player
-  // domain instead of the source IP (whose TLS cert many TV/mobile browsers reject).
-  // The extracted player keeps the source referer baked into its own URL, so the
-  // referer check still passes. raw: force the source's p2.php wrapper (needed only
-  // if extraction fails or a player misbehaves) — requires trusting the source cert.
-  const mode = ['clean', 'raw'].includes(req.query.mode) ? req.query.mode : 'auto';
   if (!post || !type || !nume) return res.redirect('/');
   try {
     const embed = await resolveEmbed(post, type, nume);
@@ -451,24 +459,15 @@ app.get('/play', async (req, res) => {
     let src = embed.startsWith('http') ? embed : SOURCE + embed;
 
     // If the embed is the source's own wrapper page (p2.php), the browser would have
-    // to connect to the source IP directly. We extract the real player instead, unless
-    // raw mode is explicitly requested. resolveClean falls back to the wrapper if it
-    // can't find an inner player.
+    // to connect to the source IP directly (whose TLS cert many TV/mobile browsers
+    // reject). Extract the real player instead — it keeps the source referer baked
+    // into its own URL, so referer checks still pass. resolveClean falls back to the
+    // wrapper only if it can't find an inner player.
     const onSource = new URL(src).host === new URL(SOURCE).host;
-    let usingWrapper = onSource;
-    if (onSource && mode !== 'raw') {
-      const clean = await resolveClean(src);
-      if (clean) { src = clean; usingWrapper = false; }
-    }
-
-    let toggle = '';
     if (onSource) {
-      const nextMode = usingWrapper ? 'clean' : 'raw';
-      const label = usingWrapper ? 'Bandyti švarų režimą' : 'Jei neveikia, spausk čia';
-      const qs = new URLSearchParams({ post, type, nume, t: title, back, mode: nextMode }).toString();
-      toggle = `<a class="btn alt" href="/play?${esc(qs)}">${label}</a>`;
+      const clean = await resolveClean(src);
+      if (clean) src = clean;
     }
-    const statusNote = usingWrapper ? ' (originalus režimas)' : '';
 
     res.send(`<!DOCTYPE html>
 <html lang="lt">
@@ -482,8 +481,7 @@ app.get('/play', async (req, res) => {
 <body class="playerpage">
 <div class="playerbar">
   <a class="btn" href="${esc(back)}" autofocus>‹ Grįžti</a>
-  <span class="playertitle">${esc(title)}${statusNote}</span>
-  ${toggle}
+  <span class="playertitle">${esc(title)}</span>
 </div>
 <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
 <script src="/tv.js"></script>
