@@ -1,0 +1,196 @@
+/* TV-first: big targets, strong focus rings, dark theme */
+* { box-sizing: border-box; }
+html { font-size: 18px; }
+body {
+  margin: 0;
+  background: #0e0f13;
+  color: #e8e8ec;
+  font-family: "Segoe UI", Roboto, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; text-decoration: none; }
+img { display: block; }
+
+/* visible focus everywhere — this is how you "see the cursor" on a TV remote */
+a:focus, button:focus, input:focus, .card:focus {
+  outline: 4px solid #e5a00d;
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+.card:focus { transform: scale(1.04); }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  flex-wrap: wrap;
+  padding: 0.8rem 2rem;
+  background: #16181f;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.logo { font-size: 1.4rem; font-weight: 700; padding: 0.3rem 0.5rem; }
+.topbar nav { display: flex; gap: 0.4rem; }
+.navlink {
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  font-weight: 600;
+  color: #b8bac2;
+}
+.navlink.active { background: #2a2d38; color: #fff; }
+.search { display: flex; gap: 0.5rem; flex: 1; min-width: 260px; max-width: 540px; margin-left: auto; }
+.search input {
+  flex: 1;
+  font-size: 1.05rem;
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  border: 2px solid #3a3d48;
+  background: #1d2029;
+  color: #fff;
+}
+.search button, .btn {
+  font-size: 1.05rem;
+  padding: 0.6rem 1.2rem;
+  border-radius: 8px;
+  border: none;
+  background: #e5a00d;
+  color: #14151a;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-block;
+}
+.btn.alt { background: #3a3d48; color: #e8e8ec; }
+
+main { padding: 1rem 2rem 3rem; max-width: 1700px; margin: 0 auto; }
+.section-title {
+  font-size: 1.35rem;
+  margin: 1.6rem 0 0.9rem;
+  border-left: 5px solid #e5a00d;
+  padding-left: 0.7rem;
+}
+
+/* card grid */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 1.1rem;
+}
+.card { border-radius: 8px; }
+.card .poster {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1d2029;
+}
+.card .poster img { width: 100%; height: 100%; object-fit: cover; }
+.badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  background: rgba(0,0,0,0.75);
+  color: #ffd66b;
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.badge.eps { top: auto; bottom: 6px; color: #9fd4ff; }
+.badge.kind { left: auto; right: 6px; color: #c5f0a4; }
+.card-title {
+  margin-top: 0.45rem;
+  font-size: 0.98rem;
+  font-weight: 600;
+  line-height: 1.25;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* search results */
+.results { display: flex; flex-direction: column; gap: 0.9rem; }
+.result {
+  display: flex;
+  gap: 1rem;
+  background: #16181f;
+  border-radius: 10px;
+  padding: 0.8rem;
+}
+.result img { width: 92px; min-width: 92px; border-radius: 6px; object-fit: cover; }
+.result-title { font-size: 1.15rem; font-weight: 700; }
+.result-title .orig { color: #8e919c; font-weight: 400; font-size: 0.95rem; }
+.result-meta { margin: 0.4rem 0; display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.result-desc { color: #b8bac2; margin: 0.2rem 0 0; font-size: 0.95rem; }
+.empty { color: #8e919c; font-size: 1.1rem; }
+
+.chip {
+  background: #2a2d38;
+  border-radius: 6px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.chip.genre { background: #243042; }
+
+/* detail page */
+.detail { display: flex; gap: 1.6rem; margin-top: 1.4rem; flex-wrap: wrap; }
+.detail-poster { width: 220px; border-radius: 10px; align-self: flex-start; }
+.detail-info { flex: 1; min-width: 300px; }
+.detail-info h1 { margin: 0 0 0.3rem; font-size: 1.9rem; }
+.orig-title { color: #8e919c; font-size: 1.1rem; margin-bottom: 0.7rem; }
+.meta-row { display: flex; gap: 0.45rem; flex-wrap: wrap; margin: 0.5rem 0; }
+.desc { color: #c9cbd3; line-height: 1.55; max-width: 70ch; }
+
+/* server / episode buttons */
+.srvlist { display: flex; flex-wrap: wrap; gap: 0.7rem; }
+.btn.srv { background: #2e7d32; color: #fff; }
+.btn.srv small { opacity: 0.75; font-weight: 400; }
+.btn.srv.trailer { background: #8e2430; }
+.episode {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.55rem 0.8rem;
+  border-radius: 8px;
+  background: #16181f;
+  margin-bottom: 0.55rem;
+}
+.ep-label { font-weight: 700; min-width: 90px; font-size: 1.05rem; }
+.ep-servers { display: flex; gap: 0.55rem; flex-wrap: wrap; }
+.ep-servers .btn { padding: 0.45rem 0.9rem; font-size: 0.95rem; }
+
+/* cast */
+.cast { display: flex; gap: 1rem; overflow-x: auto; padding-bottom: 0.6rem; }
+.person { min-width: 110px; text-align: center; }
+.person img { width: 92px; height: 92px; object-fit: cover; border-radius: 50%; margin: 0 auto 0.4rem; background: #1d2029; }
+.person-name { font-size: 0.9rem; font-weight: 600; }
+.person-role { font-size: 0.8rem; color: #8e919c; }
+
+/* pager + errors */
+.pager { display: flex; align-items: center; gap: 1rem; justify-content: center; margin: 2rem 0 0; }
+.pageno { color: #8e919c; }
+.errorbox { text-align: center; margin-top: 4rem; }
+.errorbox .btn { margin: 0.5rem; }
+
+/* player page */
+.playerpage { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.playerbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: #16181f;
+}
+.playertitle { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.playerframe { border: 0; width: 100%; flex: 1; background: #000; }
+
+/* phone / iPad portrait tweaks */
+@media (max-width: 700px) {
+  main { padding: 0.8rem 1rem 2rem; }
+  .topbar { padding: 0.6rem 1rem; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.7rem; }
+  .detail-poster { width: 150px; }
+}
