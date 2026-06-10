@@ -1,5 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cheerio = require('cheerio');
 
@@ -62,15 +64,65 @@ async function srcFetch(path, opts = {}) {
   return res.text();
 }
 
-async function getPage(path, ttlMs = 5 * 60 * 1000) {
-  const hit = cache.get(path);
+async function getPage(srcPath, ttlMs = 5 * 60 * 1000) {
+  const hit = cache.get(srcPath);
   if (hit && hit.exp > Date.now()) return hit.html;
-  const html = await srcFetch(path);
-  cache.set(path, { html, exp: Date.now() + ttlMs });
+  const html = await srcFetch(srcPath);
+  cache.set(srcPath, { html, exp: Date.now() + ttlMs });
   if (cache.size > 200) {
     for (const [k, v] of cache) if (v.exp < Date.now()) cache.delete(k);
   }
   return html;
+}
+
+/* ------------------------- watched store (shared, on disk) -------------------
+   Server-side so every device sees the same state. Marked automatically when a
+   player opens (i.e. when a stream provider link is clicked). Persisted as JSON;
+   no native dependencies, fine for a single-process app on Hostinger. */
+
+const WATCHED_FILE = process.env.WATCHED_FILE || path.join(__dirname, 'data', 'watched.json');
+let watched = {};
+try {
+  watched = JSON.parse(fs.readFileSync(WATCHED_FILE, 'utf8')) || {};
+} catch { /* first run — no file yet */ }
+
+let saveTimer = null;
+function persistWatched() {
+  // debounce bursts of writes, then write atomically (temp file + rename)
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.mkdirSync(path.dirname(WATCHED_FILE), { recursive: true });
+      const tmp = WATCHED_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(watched));
+      fs.renameSync(tmp, WATCHED_FILE);
+    } catch (e) { console.error('watched persist failed:', e.message); }
+  }, 400);
+}
+
+// key = the local detail path, e.g. /t/filmas/slug (no trailing slash)
+function watchedKey(u) {
+  if (!u) return null;
+  let p = u;
+  try { p = new URL(u, 'http://x').pathname; } catch { /* already a path */ }
+  try { p = decodeURIComponent(p); } catch { /* leave as-is */ }
+  p = p.replace(/\/+$/, '');
+  return p.startsWith('/t/') ? p : null;
+}
+
+function markWatched(key, { title, kind, ep } = {}) {
+  if (!key) return;
+  const rec = watched[key] || { eps: [] };
+  rec.t = Date.now();
+  if (title) rec.title = title;
+  if (kind) rec.kind = kind;
+  if (ep) {
+    rec.eps = rec.eps || [];
+    if (!rec.eps.includes(ep)) rec.eps.push(ep);
+  }
+  watched[key] = rec;
+  persistWatched();
 }
 
 /* --------------------------------- helpers --------------------------------- */
@@ -185,13 +237,14 @@ function parseServerLi($, li) {
   };
 }
 
-// Put DOOD and STREAMT servers first, then everything else in original order.
+// Order: YouTube trailer first, then DOOD and STREAMT, then everything else.
 function sortServers(servers) {
   const rank = (s) => {
+    if (s.nume === 'trailer') return 0;
     const t = (s.tag || '').toUpperCase();
-    if (t.includes('DOOD')) return 0;
-    if (t.includes('STREAMT')) return 1;
-    return 2;
+    if (t.includes('DOOD')) return 1;
+    if (t.includes('STREAMT')) return 2;
+    return 3;
   };
   return servers
     .map((s, i) => ({ s, i }))
@@ -311,16 +364,20 @@ ${body}
 }
 
 function cardGrid(items) {
-  return `<div class="grid">` + items.map(i => `
-  <a class="card" href="${esc(i.url)}">
+  return `<div class="grid">` + items.map(i => {
+    const seen = !!watched[watchedKey(i.url)];
+    return `
+  <a class="card${seen ? ' is-watched' : ''}" href="${esc(i.url)}">
     <div class="poster">
       <img loading="lazy" src="${esc(i.poster)}" alt="${esc(i.title)}">
       ${i.rating ? `<span class="badge">★ ${esc(i.rating.replace(/[^\d.,]/g, ''))}</span>` : ''}
       ${i.episodes ? `<span class="badge eps">${esc(i.episodes)} ser.</span>` : ''}
       ${i.kind === 'serialai' ? `<span class="badge kind">Serialas</span>` : ''}
+      ${seen ? `<span class="badge watched">✓ Žiūrėta</span>` : ''}
     </div>
     <div class="card-title">${esc(i.title)}</div>
-  </a>`).join('') + `</div>`;
+  </a>`;
+  }).join('') + `</div>`;
 }
 
 function errorPage(res, err, backUrl = '/') {
@@ -372,19 +429,23 @@ app.get('/search', async (req, res) => {
     const results = parseSearch(await getPage('/?s=' + encodeURIComponent(q), 60 * 1000));
     const body = `
     <h2 class="section-title">Rezultatai: ${esc(q)} (${results.length})</h2>
-    ${results.length ? `<div class="results">` + results.map(r => `
-      <a class="result" href="${esc(r.url)}">
+    ${results.length ? `<div class="results">` + results.map(r => {
+      const seen = !!watched[watchedKey(r.url)];
+      return `
+      <a class="result${seen ? ' is-watched' : ''}" href="${esc(r.url)}">
         <img loading="lazy" src="${esc(r.poster)}" alt="">
         <div class="result-info">
           <div class="result-title">${esc(r.title)}${r.original ? ` <span class="orig">/ ${esc(r.original)}</span>` : ''}</div>
           <div class="result-meta">
+            ${seen ? `<span class="chip watched">✓ Žiūrėta</span>` : ''}
             <span class="chip">${r.kind === 'serialai' ? 'Serialas' : 'Filmas'}</span>
             ${r.rating ? `<span class="chip">${esc(r.rating)}</span>` : ''}
             ${r.year ? `<span class="chip">${esc(r.year)}</span>` : ''}
           </div>
           ${r.desc ? `<p class="result-desc">${esc(r.desc)}</p>` : ''}
         </div>
-      </a>`).join('') + `</div>` : `<p class="empty">Nieko nerasta.</p>`}`;
+      </a>`;
+    }).join('') + `</div>` : `<p class="empty">Nieko nerasta.</p>`}`;
     res.send(layout(`Paieška: ${q}`, body, { query: q }));
   } catch (e) { errorPage(res, e); }
 });
@@ -395,6 +456,9 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
   try {
     const d = parseDetail(await getPage(`/${type}/${encodeURIComponent(slug)}/?old`));
     if (!d.title) throw new Error('Nepavyko perskaityti puslapio (gal pasikeitė šaltinio struktūra?)');
+
+    const wrec = watched[watchedKey(backUrl)];
+    const seenEps = (wrec && wrec.eps) || [];
 
     const playLink = (s, ep = '') =>
       `/play?post=${encodeURIComponent(s.post)}&type=${encodeURIComponent(s.type)}&nume=${encodeURIComponent(s.nume)}&t=${encodeURIComponent(d.title + (ep ? ' – ' + ep : ''))}${ep ? `&ep=${encodeURIComponent(ep)}` : ''}&back=${encodeURIComponent(backUrl)}`;
@@ -408,13 +472,16 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
         </a>`).join('') + `</div>`;
       if (!(d.servers || []).length) sources += `<p class="empty">Šaltinių nerasta.</p>`;
     } else {
-      sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => `
-      <div class="episode" data-ep="${esc(ep.label)}">
-        <div class="ep-label">${esc(ep.label)}</div>
+      sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => {
+        const epSeen = seenEps.includes(ep.label);
+        return `
+      <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
+        <div class="ep-label">${esc(ep.label)}${epSeen ? ` <span class="eptick">✓</span>` : ''}</div>
         <div class="ep-servers">` + ep.servers.map(s => `
           <a class="btn srv" data-ep="${esc(ep.label)}" href="${playLink(s, ep.label)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
         </div>
-      </div>`).join('');
+      </div>`;
+      }).join('');
       if (!(d.episodes || []).length) sources += `<p class="empty">Epizodų nerasta.</p>`;
     }
 
@@ -433,7 +500,7 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
           ${d.rating ? `<span class="chip">★ ${esc(d.rating)} (${esc(d.votes)})</span>` : ''}
         </div>
         ${d.genres.length ? `<div class="meta-row">${d.genres.map(g => `<span class="chip genre">${esc(g)}</span>`).join('')}</div>` : ''}
-        <div id="watched-ctl" class="watched-ctl" data-kind="${esc(d.kind)}"></div>
+        ${wrec ? `<div class="meta-row"><span class="chip watched">✓ Žiūrėta</span></div>` : ''}
         ${d.description ? `<p class="desc">${esc(d.description)}</p>` : ''}
       </div>
     </div>
@@ -454,6 +521,19 @@ app.get('/play', async (req, res) => {
   const title = (req.query.t || 'Grotuvas').toString();
   const back = (req.query.back || '/').toString();
   if (!post || !type || !nume) return res.redirect('/');
+
+  // Opening a real provider == watched. Record it server-side so all devices see
+  // it. The trailer doesn't count as watching the title.
+  const key = watchedKey(back);
+  if (key && nume !== 'trailer') {
+    const ep = (req.query.ep || '').toString();
+    markWatched(key, {
+      title: title.split(' – ')[0],
+      kind: key.startsWith('/t/serialai/') ? 'serialai' : 'filmas',
+      ep: ep || undefined,
+    });
+  }
+
   try {
     const embed = await resolveEmbed(post, type, nume);
     if (!embed) throw new Error('Serveris negrąžino grotuvo nuorodos');

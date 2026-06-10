@@ -9,9 +9,9 @@ TV-friendly proxy UI for the source movie site (`https://176.97.124.32`). Node.j
 - **Search bar** (proxies the source's WordPress search).
 - **Browse pages** `/filmai` and `/serialai` with pagination.
 - **Detail pages** show poster, original title, year, IMDb, runtime, language, genres, description and cast — parsed live from the source.
-- **Movies** get a row of source/server buttons; **series** are auto-detected and get an episode list, each with its own server buttons. **DOOD and STREAMT servers are listed first**, then the rest in source order.
+- **Movies** get a row of source/server buttons; **series** are auto-detected and get an episode list, each with its own server buttons. Order: **YouTube trailer first, then DOOD and STREAMT**, then the rest in source order.
 - **Clean playback**: picking a server resolves the real video player URL server-side and embeds the trusted player domain directly — the source's popup-ad wrapper (`p2.php`) is skipped, and the browser never has to connect to the source IP (whose TLS cert many TV browsers reject). Video streams straight from the player CDN to the TV, not through this server. If extraction fails, it falls back to the wrapper automatically.
-- **Watched tracking**: opening a player marks that title as watched (series also record the episode). Watched items get a ✓ badge on every card/search result, and the detail page shows a toggle plus per-episode ticks. Stored in the browser's `localStorage` — per device, no account or server state.
+- **Watched tracking (cross-device)**: opening a real stream provider automatically marks that title as watched (series also record the specific episode; trailers don't count). Watched items get a ✓ badge on every card/search result, plus per-episode ticks on series. State is stored **server-side** in `data/watched.json`, so all devices that use the same server share it — no manual marking, no per-device state. Override the path with the `WATCHED_FILE` env var.
 - **TV remote navigation**: arrow keys move focus spatially with a big yellow focus ring; the remote's Back button goes back. Works with mouse/touch on iPad too.
 
 ## Run locally
@@ -30,6 +30,7 @@ npm start          # http://localhost:3000  (login: admin / pass)
 | `PORT`         | `3000`                   | HTTP port (Hostinger sets this automatically)    |
 | `SOURCE_URL`   | `https://176.97.124.32`  | Source site (change here if its IP ever changes) |
 | `INSECURE_TLS` | unset                    | Set `1` only if the source TLS cert breaks       |
+| `WATCHED_FILE` | `./data/watched.json`    | Where watched state is stored (JSON file)        |
 
 > Note: after changing `AUTH_PASS`, devices that stored the old auth cookie will be asked to log in again.
 
