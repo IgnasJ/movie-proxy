@@ -822,7 +822,7 @@ app.get('/play', async (req, res) => {
 </div>
 <div class="player-stage">
   <div class="player-box">
-    <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
+    <iframe class="playerframe" src="${esc(src)}" sandbox="allow-scripts allow-same-origin allow-forms allow-presentation" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
   </div>
 </div>
 <script src="/tv.js"></script>
