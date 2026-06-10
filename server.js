@@ -2,6 +2,8 @@ require('dotenv').config();
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
+const { execFile } = require('child_process');
 const express = require('express');
 const cheerio = require('cheerio');
 
@@ -374,6 +376,62 @@ async function resolveClean(embedUrl) {
     if (m && m[1] && !m[1].includes('p2.php')) return m[1];
   } catch { /* fall back to the wrapper */ }
   return null;
+}
+
+/* ------------------------------ DoodStream bypass ----------------------------
+   DoodStream refuses to play when sandboxed, so we can't block its popups that
+   way. Instead, for dood hosts we offer a "bypass" that replicates dood's own
+   pass_md5 token handshake server-side to get the direct MP4, then plays it in
+   our own <video> via /stream (which proxies the bytes with the required
+   Referer). This skips dood's ad page entirely. Fragile by nature — dood rotates
+   the scheme periodically; falls back to the normal iframe when it stops working. */
+
+const DOOD_RE = /(^|\.)(dood|do0+d|ds2play|ds2video|d0{2,}d|vidply|doods)\b|dood|ds2(play|video)|d0{3,}d/i;
+function isDoodHost(host) { return DOOD_RE.test(host || ''); }
+
+function randStr(n) {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let s = '';
+  for (let i = 0; i < n; i++) s += c[crypto.randomInt(c.length)];
+  return s;
+}
+
+// dood's HTML pages sit behind Cloudflare, which 403s Node's fetch (flagged TLS
+// fingerprint). The system curl binary passes, so we use it for the text fetches.
+// curl -w appends the final (post-redirect) URL after a marker so we can recover
+// the rotating mirror origin (dood.pm -> playmogo.com, etc.).
+const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
+function curlFetch(url, referer) {
+  return new Promise((resolve, reject) => {
+    execFile(CURL, ['-k', '-s', '-L', '-m', '25', '-A', UA, '-e', referer || (new URL(url).origin + '/'),
+      '-w', '\n@@U@@%{url_effective}', url], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      const i = stdout.lastIndexOf('\n@@U@@');
+      if (i < 0) return resolve({ body: stdout, finalUrl: url });
+      resolve({ body: stdout.slice(0, i), finalUrl: stdout.slice(i + 6).trim() });
+    });
+  });
+}
+
+// embed url (https://dood.x/e/<id>) -> { url: direct mp4, referer }
+async function resolveDoodMp4(embedUrl) {
+  const start = embedUrl.replace('/d/', '/e/');
+  const { body: page, finalUrl } = await curlFetch(start, new URL(start).origin + '/');
+  const origin = new URL(finalUrl).origin;
+  const m = page.match(/\/pass_md5\/[\w-]+\/[\w-]+/);
+  if (!m) return null;
+  const passPath = m[0];
+  const token = passPath.split('/').pop();
+  const { body } = await curlFetch(origin + passPath, finalUrl);
+  const base = body.trim();
+  if (!/^https?:\/\//.test(base)) return null;
+  const mp4 = `${base}${randStr(10)}?token=${token}&expiry=${Date.now()}`;
+  return { url: mp4, referer: origin + '/' };
+}
+
+// sign a /stream target so the proxy only serves URLs we minted (no open proxy)
+function streamSig(u, r) {
+  return crypto.createHash('sha256').update(`${u}|${r}|${authToken}`).digest('hex').slice(0, 16);
 }
 
 /* ---------------------------------- providers -------------------------------
@@ -806,7 +864,36 @@ app.get('/play', async (req, res) => {
   try {
     const src = await provider.play(req.query);
     if (!src) throw new Error('Nepavyko gauti grotuvo nuorodos');
-    res.send(`<!DOCTYPE html>
+
+    const dood = isDoodHost(new URL(src).host);
+    const wantBypass = req.query.bypass === '1';
+
+    // --- DoodStream bypass: extract the direct MP4 and play it ourselves ---
+    if (dood && wantBypass) {
+      const direct = await resolveDoodMp4(src);
+      if (direct) {
+        const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
+        return res.send(playerShell(title, back, `
+    <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
+      }
+      // extraction failed — fall through to the normal iframe with a note
+    }
+
+    // DoodStream refuses to play when sandboxed; everything else stays sandboxed.
+    const sandbox = dood ? '' : ' sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"';
+    const bypassBtn = dood && !wantBypass
+      ? `<a class="btn alt" href="/play?${esc(new URLSearchParams({ ...req.query, bypass: '1' }).toString())}">Be reklamų (bandyti)</a>`
+      : '';
+    const note = dood && wantBypass
+      ? `<div class="player-note">Nepavyko apeiti reklamų — rodomas originalus grotuvas.</div>` : '';
+
+    res.send(playerShell(title, back, `
+    <iframe class="playerframe" src="${esc(src)}"${sandbox} allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>`, bypassBtn, note));
+  } catch (e) { errorPage(res, e, back); }
+});
+
+function playerShell(title, back, inner, extraBtn = '', note = '') {
+  return `<!DOCTYPE html>
 <html lang="lt">
 <head>
 <meta charset="utf-8">
@@ -819,16 +906,39 @@ app.get('/play', async (req, res) => {
 <div class="playerbar">
   <a class="btn" href="${esc(back)}" autofocus>‹ Grįžti</a>
   <span class="playertitle">${esc(title)}</span>
+  ${extraBtn}
 </div>
+${note}
 <div class="player-stage">
-  <div class="player-box">
-    <iframe class="playerframe" src="${esc(src)}" sandbox="allow-scripts allow-same-origin allow-forms allow-presentation" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
+  <div class="player-box">${inner}
   </div>
 </div>
 <script src="/tv.js"></script>
 </body>
-</html>`);
-  } catch (e) { errorPage(res, e, back); }
+</html>`;
+}
+
+// Proxy the direct video bytes (DoodStream MP4 is Referer-locked, so the browser
+// can't fetch it itself). Only serves URLs we signed; forwards Range for seeking.
+app.get('/stream', async (req, res) => {
+  const u = (req.query.u || '').toString();
+  const r = (req.query.r || '').toString();
+  const s = (req.query.s || '').toString();
+  if (!u || s !== streamSig(u, r)) return res.status(403).end();
+  try {
+    const headers = { 'User-Agent': UA, 'Referer': r, 'Accept': '*/*' };
+    if (req.headers.range) headers.Range = req.headers.range;
+    const up = await fetch(u, { headers });
+    res.status(up.status);
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']) {
+      const v = up.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    if (!up.body) return res.end();
+    Readable.fromWeb(up.body).pipe(res);
+  } catch (e) {
+    res.status(502).end();
+  }
 });
 
 app.use((req, res) => res.status(404).send(layout('Nerasta', `
