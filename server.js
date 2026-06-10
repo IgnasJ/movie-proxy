@@ -879,8 +879,6 @@ app.get('/play', async (req, res) => {
       // extraction failed — fall through to the normal iframe with a note
     }
 
-    // DoodStream refuses to play when sandboxed; everything else stays sandboxed.
-    const sandbox = dood ? '' : ' sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"';
     const bypassBtn = dood && !wantBypass
       ? `<a class="btn alt" href="/play?${esc(new URLSearchParams({ ...req.query, bypass: '1' }).toString())}">Be reklamų (bandyti)</a>`
       : '';
@@ -888,7 +886,7 @@ app.get('/play', async (req, res) => {
       ? `<div class="player-note">Nepavyko apeiti reklamų — rodomas originalus grotuvas.</div>` : '';
 
     res.send(playerShell(title, back, `
-    <iframe class="playerframe" src="${esc(src)}"${sandbox} allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>`, bypassBtn, note));
+    <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>`, bypassBtn, note));
   } catch (e) { errorPage(res, e, back); }
 });
 
