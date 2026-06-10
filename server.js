@@ -438,9 +438,11 @@ app.get('/play', async (req, res) => {
   const { post, type, nume } = req.query;
   const title = (req.query.t || 'Grotuvas').toString();
   const back = (req.query.back || '/').toString();
-  // auto (default): keep the source wrapper for referer-protected players, embed
-  // direct players as-is. clean: strip the source ad-wrapper (may break players
-  // that require the source referer). raw: force the source wrapper.
+  // auto (default): extract the real player so the browser loads a trusted player
+  // domain instead of the source IP (whose TLS cert many TV/mobile browsers reject).
+  // The extracted player keeps the source referer baked into its own URL, so the
+  // referer check still passes. raw: force the source's p2.php wrapper (needed only
+  // if extraction fails or a player misbehaves) — requires trusting the source cert.
   const mode = ['clean', 'raw'].includes(req.query.mode) ? req.query.mode : 'auto';
   if (!post || !type || !nume) return res.redirect('/');
   try {
@@ -448,13 +450,13 @@ app.get('/play', async (req, res) => {
     if (!embed) throw new Error('Serveris negrąžino grotuvo nuorodos');
     let src = embed.startsWith('http') ? embed : SOURCE + embed;
 
-    // A player served from the source domain (e.g. p2.php) loads the real player
-    // itself, so the player's referrer becomes the source — which referer-checking
-    // players require. Extracting it ("clean") moves that load onto our domain and
-    // breaks the check, so we only extract when explicitly asked.
+    // If the embed is the source's own wrapper page (p2.php), the browser would have
+    // to connect to the source IP directly. We extract the real player instead, unless
+    // raw mode is explicitly requested. resolveClean falls back to the wrapper if it
+    // can't find an inner player.
     const onSource = new URL(src).host === new URL(SOURCE).host;
     let usingWrapper = onSource;
-    if (onSource && mode === 'clean') {
+    if (onSource && mode !== 'raw') {
       const clean = await resolveClean(src);
       if (clean) { src = clean; usingWrapper = false; }
     }
@@ -462,11 +464,11 @@ app.get('/play', async (req, res) => {
     let toggle = '';
     if (onSource) {
       const nextMode = usingWrapper ? 'clean' : 'raw';
-      const label = usingWrapper ? 'Bandyti be reklamų' : 'Jei neveikia, spausk čia';
+      const label = usingWrapper ? 'Bandyti švarų režimą' : 'Jei neveikia, spausk čia';
       const qs = new URLSearchParams({ post, type, nume, t: title, back, mode: nextMode }).toString();
       toggle = `<a class="btn alt" href="/play?${esc(qs)}">${label}</a>`;
     }
-    const statusNote = usingWrapper ? ' (su reklama)' : '';
+    const statusNote = usingWrapper ? ' (originalus režimas)' : '';
 
     res.send(`<!DOCTYPE html>
 <html lang="lt">
