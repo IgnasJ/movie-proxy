@@ -4,7 +4,7 @@ TV-friendly proxy UI for the source movie site (`https://176.97.124.32`). Node.j
 
 ## What it does
 
-- **Basic auth** on every page (browser remembers it; a cookie is also set so the TV isn't re-prompted).
+- **Login page**: a proper styled form (not the browser's Basic Auth popup). A session cookie keeps you logged in for a year, so the TV isn't re-prompted; an "Atsijungti" link logs out. Credentials come from `.env`.
 - **Front page** mirrors the source: "Populiaru dabar", "Naujausi filmai" and "Naujausi serialai" as separate sections.
 - **Search bar** (proxies the source's WordPress search).
 - **Browse pages** `/filmai` and `/serialai` with pagination.

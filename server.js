@@ -22,26 +22,72 @@ app.disable('x-powered-by');
 
 const authToken = crypto.createHash('sha256').update(`${AUTH_USER}:${AUTH_PASS}:mp-salt`).digest('hex');
 
-app.use((req, res, next) => {
-  const cookies = req.headers.cookie || '';
-  if (cookies.includes(`mpauth=${authToken}`)) return next();
-  const hdr = req.headers.authorization || '';
-  if (hdr.startsWith('Basic ')) {
-    const decoded = Buffer.from(hdr.slice(6), 'base64').toString();
-    const sep = decoded.indexOf(':');
-    const u = decoded.slice(0, sep);
-    const p = decoded.slice(sep + 1);
-    if (u === AUTH_USER && p === AUTH_PASS) {
-      // remember on this device so the TV doesn't re-prompt
-      res.setHeader('Set-Cookie', `mpauth=${authToken}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
-      return next();
-    }
-  }
-  res.set('WWW-Authenticate', 'Basic realm="Movies", charset="UTF-8"');
-  res.status(401).send('Reikalingas prisijungimas / Authentication required');
+function isAuthed(req) {
+  return (req.headers.cookie || '').includes(`mpauth=${authToken}`);
+}
+
+// only allow redirecting back to a safe local path (no protocol-relative // jumps)
+function safeNext(next) {
+  return typeof next === 'string' && /^\/(?!\/)/.test(next) ? next : '/';
+}
+
+function loginPage({ error = false, next = '/' } = {}) {
+  return `<!DOCTYPE html>
+<html lang="lt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Prisijungimas</title>
+<link rel="stylesheet" href="/tv.css">
+</head>
+<body class="loginpage">
+<form class="login-card" action="/login" method="post">
+  <div class="login-logo">🎬 Filmai</div>
+  ${error ? `<div class="login-error">Neteisingas vartotojas arba slaptažodis</div>` : ''}
+  <input type="hidden" name="next" value="${esc(next)}">
+  <label>Vartotojas
+    <input type="text" name="username" autocomplete="username" autofocus required>
+  </label>
+  <label>Slaptažodis
+    <input type="password" name="password" autocomplete="current-password" required>
+  </label>
+  <button type="submit">Prisijungti</button>
+</form>
+<script src="/tv.js"></script>
+</body>
+</html>`;
+}
+
+// static assets and the login page are reachable without a session
+app.use(express.static('public', { maxAge: '7d' }));
+app.use(express.urlencoded({ extended: false }));
+
+app.get('/login', (req, res) => {
+  if (isAuthed(req)) return res.redirect(safeNext(req.query.next));
+  res.send(loginPage({ error: req.query.error === '1', next: safeNext(req.query.next) }));
 });
 
-app.use(express.static('public', { maxAge: '7d' }));
+app.post('/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const next = safeNext(req.body && req.body.next);
+  if (username === AUTH_USER && password === AUTH_PASS) {
+    res.setHeader('Set-Cookie', `mpauth=${authToken}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+    return res.redirect(next);
+  }
+  res.status(401).send(loginPage({ error: true, next }));
+});
+
+app.get('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'mpauth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
+  res.redirect('/login');
+});
+
+// everything below requires a session
+app.use((req, res, next) => {
+  if (isAuthed(req)) return next();
+  res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));
+});
 
 /* ------------------------------ source fetching ---------------------------- */
 
@@ -354,6 +400,7 @@ function layout(title, body, { query = '', active = '' } = {}) {
     <input type="search" name="q" placeholder="Ieškoti filmo ar serialo..." value="${esc(query)}" enterkeyhint="search">
     <button type="submit">Ieškoti</button>
   </form>
+  <a class="navlink logout" href="/logout">Atsijungti</a>
 </header>
 <main>
 ${body}
