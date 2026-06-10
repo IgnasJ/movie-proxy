@@ -820,7 +820,11 @@ app.get('/play', async (req, res) => {
   <a class="btn" href="${esc(back)}" autofocus>‹ Grįžti</a>
   <span class="playertitle">${esc(title)}</span>
 </div>
-<iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
+<div class="player-stage">
+  <div class="player-box">
+    <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
+  </div>
+</div>
 <script src="/tv.js"></script>
 </body>
 </html>`);
