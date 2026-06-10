@@ -11,6 +11,7 @@ TV-friendly proxy UI for the source movie site (`https://176.97.124.32`). Node.j
 - **Detail pages** show poster, original title, year, IMDb, runtime, language, genres, description and cast — parsed live from the source.
 - **Movies** get a row of source/server buttons; **series** are auto-detected and get an episode list, each with its own server buttons. **DOOD and STREAMT servers are listed first**, then the rest in source order.
 - **Clean playback**: picking a server resolves the real video player URL server-side and embeds the trusted player domain directly — the source's popup-ad wrapper (`p2.php`) is skipped, and the browser never has to connect to the source IP (whose TLS cert many TV browsers reject). Video streams straight from the player CDN to the TV, not through this server. If extraction fails, it falls back to the wrapper automatically.
+- **Watched tracking**: opening a player marks that title as watched (series also record the episode). Watched items get a ✓ badge on every card/search result, and the detail page shows a toggle plus per-episode ticks. Stored in the browser's `localStorage` — per device, no account or server state.
 - **TV remote navigation**: arrow keys move focus spatially with a big yellow focus ring; the remote's Back button goes back. Works with mouse/touch on iPad too.
 
 ## Run locally

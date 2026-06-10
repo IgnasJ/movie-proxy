@@ -396,8 +396,8 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
     const d = parseDetail(await getPage(`/${type}/${encodeURIComponent(slug)}/?old`));
     if (!d.title) throw new Error('Nepavyko perskaityti puslapio (gal pasikeitė šaltinio struktūra?)');
 
-    const playLink = (s, extra = '') =>
-      `/play?post=${encodeURIComponent(s.post)}&type=${encodeURIComponent(s.type)}&nume=${encodeURIComponent(s.nume)}&t=${encodeURIComponent(d.title + extra)}&back=${encodeURIComponent(backUrl)}`;
+    const playLink = (s, ep = '') =>
+      `/play?post=${encodeURIComponent(s.post)}&type=${encodeURIComponent(s.type)}&nume=${encodeURIComponent(s.nume)}&t=${encodeURIComponent(d.title + (ep ? ' – ' + ep : ''))}${ep ? `&ep=${encodeURIComponent(ep)}` : ''}&back=${encodeURIComponent(backUrl)}`;
 
     let sources = '';
     if (d.kind === 'movie') {
@@ -409,10 +409,10 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
       if (!(d.servers || []).length) sources += `<p class="empty">Šaltinių nerasta.</p>`;
     } else {
       sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => `
-      <div class="episode">
+      <div class="episode" data-ep="${esc(ep.label)}">
         <div class="ep-label">${esc(ep.label)}</div>
         <div class="ep-servers">` + ep.servers.map(s => `
-          <a class="btn srv" href="${playLink(s, ' – ' + ep.label)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
+          <a class="btn srv" data-ep="${esc(ep.label)}" href="${playLink(s, ep.label)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
         </div>
       </div>`).join('');
       if (!(d.episodes || []).length) sources += `<p class="empty">Epizodų nerasta.</p>`;
@@ -433,6 +433,7 @@ app.get('/t/:type(filmas|serialai)/:slug', async (req, res) => {
           ${d.rating ? `<span class="chip">★ ${esc(d.rating)} (${esc(d.votes)})</span>` : ''}
         </div>
         ${d.genres.length ? `<div class="meta-row">${d.genres.map(g => `<span class="chip genre">${esc(g)}</span>`).join('')}</div>` : ''}
+        <div id="watched-ctl" class="watched-ctl" data-kind="${esc(d.kind)}"></div>
         ${d.description ? `<p class="desc">${esc(d.description)}</p>` : ''}
       </div>
     </div>

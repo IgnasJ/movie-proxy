@@ -133,6 +133,20 @@ main { padding: 1rem 2rem 3rem; max-width: 1700px; margin: 0 auto; }
   white-space: nowrap;
 }
 .chip.genre { background: #243042; }
+.chip.watched { background: #1f7a33; color: #fff; }
+
+/* watched markers */
+.badge.watched {
+  top: auto; left: auto; bottom: 6px; right: 6px;
+  background: rgba(31, 122, 51, 0.92); color: #fff;
+}
+.card.is-watched .poster { outline: 3px solid rgba(46, 160, 67, 0.85); outline-offset: -3px; }
+.watched-ctl { margin: 0.7rem 0; }
+.btn.watched-toggle { background: #2a2d38; color: #e8e8ec; }
+.btn.watched-toggle.on { background: #1f7a33; color: #fff; }
+.episode.is-watched { opacity: 0.72; }
+.episode.is-watched .ep-label { color: #7fd48a; }
+.eptick { color: #7fd48a; font-weight: 700; }
 
 /* detail page */
 .detail { display: flex; gap: 1.6rem; margin-top: 1.4rem; flex-wrap: wrap; }
