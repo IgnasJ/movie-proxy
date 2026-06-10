@@ -53,6 +53,36 @@ img { display: block; }
   font-size: 0.95rem;
 }
 .navlink.logout { color: #8e919c; }
+.navlink.source-switch { color: #e5a00d; font-weight: 700; }
+
+/* source selection screen */
+.sources-intro { text-align: center; margin: 2rem 0 1.5rem; }
+.sources-intro h1 { font-size: 2rem; margin: 0 0 0.4rem; }
+.sources-intro p { color: #8e919c; margin: 0; }
+.source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1.2rem;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.source-card {
+  background: #16181f;
+  border: 3px solid transparent;
+  border-radius: 14px;
+  padding: 1.8rem 1.4rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.source-card.active { border-color: #2e7d32; }
+.source-card:focus { border-color: #e5a00d; transform: scale(1.03); }
+.source-emoji { font-size: 3rem; }
+.source-name { font-size: 1.5rem; font-weight: 700; }
+.source-desc { color: #b8bac2; font-size: 0.98rem; }
+.source-pick { margin-top: 0.6rem; color: #14151a; background: #e5a00d; font-weight: 700; padding: 0.5rem; border-radius: 8px; }
+.source-current { margin-top: 0.6rem; color: #7fd48a; font-weight: 700; }
 
 /* visible focus everywhere — this is how you "see the cursor" on a TV remote */
 a:focus, button:focus, input:focus, .card:focus {
