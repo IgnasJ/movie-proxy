@@ -9,7 +9,8 @@ const cheerio = require('cheerio');
 
 const PORT = process.env.PORT || 3000;
 const SOURCE = (process.env.SOURCE_URL || 'https://176.97.124.32').replace(/\/$/, '');
-const WL_BASE = (process.env.WATCHLUNA_URL || 'https://watchluna.com').replace(/\/$/, '');
+const TMDB_KEY = process.env.TMDB_API_KEY || '';
+const TMDB_BASE = 'https://api.themoviedb.org/3';
 const enc = encodeURIComponent;
 const AUTH_USER = process.env.AUTH_USER || 'admin';
 const AUTH_PASS = process.env.AUTH_PASS || 'pass';
@@ -487,7 +488,11 @@ const EIGHT = {
   },
 };
 
-// --- WatchLuna (Nuxt SPA backed by a public JSON API) ---
+// --- WatchLuna (catalog metadata from TMDB; playback via tmdb-id embed hosts) ---
+// WatchLuna's own site sits behind a Cloudflare JS challenge that 403s any
+// server-side fetch. Its API was only ever a thin proxy over TMDB (same field
+// names, same ids), and the embed hosts below take TMDB ids directly — so we
+// query TMDB ourselves. Works on any server with a free TMDB_API_KEY, no browser.
 const WL_SERVERS = [
   { id: 1, name: 'Serveris 1', tag: 'VidSrc',
     movie: id => `https://vidsrc-embed.ru/embed/movie?tmdb=${id}`,
@@ -505,14 +510,14 @@ function wlImg(p) {
   return /^https?:/.test(p) ? p : 'https://image.tmdb.org/t/p/w500' + (p.startsWith('/') ? p : '/' + p);
 }
 
-async function wlJson(p) {
-  const key = 'wl:' + p;
+async function tmdb(p) {
+  if (!TMDB_KEY) throw new Error('Nenustatytas TMDB_API_KEY — gauk nemokamą raktą iš themoviedb.org ir įrašyk į .env');
+  const key = 'tmdb:' + p;
   const hit = cache.get(key);
   if (hit && hit.exp > Date.now()) return hit.html;
-  const res = await fetch(WL_BASE + p, {
-    headers: { 'User-Agent': UA, 'Referer': WL_BASE + '/', 'Accept': 'application/json' },
-  });
-  if (!res.ok) throw new Error(`WatchLuna grąžino ${res.status}`);
+  const url = `${TMDB_BASE}${p}${p.includes('?') ? '&' : '?'}api_key=${TMDB_KEY}`;
+  const res = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`TMDB grąžino ${res.status}`);
   const j = await res.json();
   cache.set(key, { html: j, exp: Date.now() + (p.includes('/search') ? 60 * 1000 : 5 * 60 * 1000) });
   return j;
@@ -535,31 +540,33 @@ function wlItem(o) {
 const WL = {
   id: 'watchluna',
   async home() {
-    const t = await wlJson('/api/trending');
+    const [mv, tv] = await Promise.all([tmdb('/trending/movie/week'), tmdb('/trending/tv/week')]);
     return [
-      { title: 'Populiarūs filmai', items: (t.trendingMovies || []).map(wlItem) },
-      { title: 'Populiarūs serialai', items: (t.trendingTv || []).map(wlItem) },
+      { title: 'Populiarūs filmai', items: (mv.results || []).map(o => wlItem({ ...o, media_type: 'movie' })) },
+      { title: 'Populiarūs serialai', items: (tv.results || []).map(o => wlItem({ ...o, media_type: 'tv' })) },
     ].filter(s => s.items.length);
   },
   async archive(kind, page) {
     const isTv = kind === 'serialai';
-    const arr = await wlJson(`/api/${isTv ? 'tv' : 'movies'}/popular?page=${page}`);
-    const items = (Array.isArray(arr) ? arr : []).map(wlItem);
-    return { items, hasMore: items.length >= 20 };
+    const j = await tmdb(`/${isTv ? 'tv' : 'movie'}/popular?page=${page}`);
+    const items = (j.results || []).map(o => wlItem({ ...o, media_type: isTv ? 'tv' : 'movie' }));
+    return { items, hasMore: !!items.length && page < (j.total_pages || 1) };
   },
   async search(q) {
-    const arr = await wlJson('/api/search?query=' + enc(q));
-    return (Array.isArray(arr) ? arr : []).map(o => {
-      const it = wlItem(o);
-      const orig = (o.original_title && o.original_title !== it.title) ? o.original_title
-        : (o.original_name && o.original_name !== it.title) ? o.original_name : '';
-      return { url: it.url, title: it.title, original: orig, poster: it.poster, rating: it.rating, year: it.year, desc: o.overview || '', kind: it.kind };
-    });
+    const j = await tmdb('/search/multi?query=' + enc(q));
+    return (j.results || [])
+      .filter(o => o.media_type === 'movie' || o.media_type === 'tv')
+      .map(o => {
+        const it = wlItem(o);
+        const orig = (o.original_title && o.original_title !== it.title) ? o.original_title
+          : (o.original_name && o.original_name !== it.title) ? o.original_name : '';
+        return { url: it.url, title: it.title, original: orig, poster: it.poster, rating: it.rating, year: it.year, desc: o.overview || '', kind: it.kind };
+      });
   },
   async detail(type, id) {
     const backUrl = `/t/${type}/${enc(id)}`;
     if (type === 'movie') {
-      const m = (await wlJson('/api/movies/' + enc(id))).details;
+      const m = await tmdb('/movie/' + enc(id));
       if (!m || !m.id) throw new Error('Filmas nerastas');
       const title = m.title || m.original_title || '';
       const pl = srv => `/play?source=watchluna&kind=movie&id=${enc(id)}&server=${srv}&t=${enc(title)}&back=${enc(backUrl)}`;
@@ -574,7 +581,7 @@ const WL = {
         servers: WL_SERVERS.map(s => ({ name: s.name, tag: s.tag, play: pl(s.id) })),
       };
     }
-    const t = await wlJson('/api/tv/' + enc(id));
+    const t = await tmdb('/tv/' + enc(id));
     if (!t || !t.id) throw new Error('Serialas nerastas');
     const title = t.name || t.original_name || '';
     const episodes = [];
@@ -741,6 +748,7 @@ function errorPage(res, err, backUrl = '/') {
     <p>${esc(err.message || String(err))}</p>
     <a class="btn" href="${esc(backUrl)}">Grįžti</a>
     <a class="btn" href="">Bandyti dar kartą</a>
+    <a class="btn alt" href="/sources">Keisti šaltinį</a>
   </div>`));
 }
 
