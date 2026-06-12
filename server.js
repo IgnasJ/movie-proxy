@@ -1113,7 +1113,7 @@ app.get('/tv/play', (req, res) => {
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti kanalo. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/hls.min.js')}"></script>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(tvProxyUrl(c.url))});</script>`;
+    <script>initIptv(${JSON.stringify(c.url)}, ${JSON.stringify(tvProxyUrl(c.url))});</script>`;
 
   res.send(playerShell(c.name, '/tv', inner, buttons, '', c.epg || ''));
 });
