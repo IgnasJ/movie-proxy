@@ -471,12 +471,29 @@ main { padding: 1rem 2rem 3rem; max-width: 1700px; margin: 0 auto; }
 
 /* phone / iPad portrait tweaks */
 @media (max-width: 700px) {
-  main { padding: 0.8rem 1rem 2rem; }
-  .topbar { padding: 0.6rem 1rem; }
+  main { padding: 0.8rem 0.9rem 2rem; }
+
+  /* topbar reflows: logo (+ source/logout) on row 1, nav on row 2,
+     search full-width on row 3 — so nothing overflows the screen edge */
+  .topbar { gap: 0.5rem 0.7rem; padding: 0.6rem 0.9rem; }
+  .logo { font-size: 1.15rem; padding: 0.2rem 0.3rem; margin-right: auto; }
+  .topbar nav { order: 4; flex-basis: 100%; flex-wrap: wrap; gap: 0.3rem; }
+  .navlink { padding: 0.4rem 0.75rem; }
+  .navlink.source-switch { order: 2; }
+  .navlink.logout { order: 3; }
+  .search { order: 5; flex-basis: 100%; min-width: 0; max-width: none; margin-left: 0; }
+  .search input { min-width: 0; font-size: 1rem; }
+  .search button { font-size: 1rem; padding: 0.55rem 0.9rem; }
+
   .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.7rem; }
-  .ch { gap: 0.7rem; padding-left: 2.3rem; }
-  .ch-logo, .ch-abbr { width: 46px; height: 46px; }
-  .ch-name { width: 6.5rem; font-size: 0.95rem; }
-  .ch-epg { font-size: 0.82rem; }
+
+  /* channel list rows */
+  .ch { gap: 0.6rem; padding: 0.55rem 0.8rem 0.55rem 1.9rem; }
+  .ch-no { left: 0.5rem; font-size: 0.78rem; min-width: 1.1em; }
+  .ch-logo, .ch-abbr { width: 42px; height: 42px; }
+  .ch-abbr { font-size: 0.85rem; }
+  .ch-name { width: 5.2rem; font-size: 0.92rem; }
+  .ch-epg { font-size: 0.8rem; }
+
   .detail-poster { width: 150px; }
 }
