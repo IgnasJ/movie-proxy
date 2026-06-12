@@ -5,7 +5,9 @@
   "description": "TV-friendly proxy UI for the source movie site",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "encode-iptv": "node iptv-codec.js encode",
+    "decode-iptv": "node iptv-codec.js decode"
   },
   "engines": {
     "node": ">=18"

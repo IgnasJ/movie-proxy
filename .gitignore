@@ -4,3 +4,5 @@ shots/
 data/
 *.html
 !public/*.html
+# plaintext channel list — commit only the encoded iptv.iptv
+iptv.m3u

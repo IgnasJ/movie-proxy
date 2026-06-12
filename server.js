@@ -176,6 +176,193 @@ function markWatched(key, { title, kind, ep } = {}) {
   persistWatched();
 }
 
+/* ------------------------------- IPTV (live TV) ------------------------------
+   Channels come from a plain m3u file next to the app (iptv.m3u) so it can be
+   edited straight in the hosting file manager — changes are picked up on the
+   next page load (mtime check), no restart needed. Streams are played through
+   /tvproxy, which rewrites HLS playlists to route every segment through us.
+   That solves three TV/iPad realities at once: http:// streams on an https
+   page (mixed content), hosts without CORS headers (hls.js needs them), and
+   Referer-locked CDNs. */
+
+// Runtime playlist lives in data/ so it can be edited live in hosting. It's
+// seeded once from the encoded default (iptv.iptv) — see seedIptv() — and then
+// never overwritten, so edits survive restarts and redeploys.
+const IPTV_FILE = process.env.IPTV_FILE || path.join(__dirname, 'data', 'iptv.m3u');
+const IPTV_DEFAULT = process.env.IPTV_DEFAULT || path.join(__dirname, 'iptv.iptv');
+
+// Decode the bundled default into data/iptv.m3u on first run only. Delete
+// data/iptv.m3u (or set it via IPTV_FILE) to force a re-seed from iptv.iptv.
+function seedIptv() {
+  try {
+    if (fs.existsSync(IPTV_FILE) || !fs.existsSync(IPTV_DEFAULT)) return;
+    const { decode } = require('./iptv-codec');
+    fs.mkdirSync(path.dirname(IPTV_FILE), { recursive: true });
+    fs.writeFileSync(IPTV_FILE, decode(fs.readFileSync(IPTV_DEFAULT, 'utf8')));
+    console.log(`iptv: seeded ${IPTV_FILE} from ${path.basename(IPTV_DEFAULT)}`);
+  } catch (e) { console.error('iptv seed failed:', e.message); }
+}
+seedIptv();
+
+let iptvCache = { mtime: -1, channels: [], groups: [] };
+
+function parseM3U(text) {
+  const channels = [];
+  let meta = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF')) {
+      const attrs = {};
+      const re = /([\w-]+)="([^"]*)"/g;
+      let m;
+      while ((m = re.exec(line))) attrs[m[1].toLowerCase()] = m[2];
+      // display name = everything after the comma that follows the attributes
+      const ci = line.indexOf(',', Math.max(line.lastIndexOf('"'), 0));
+      meta = {
+        name: (ci >= 0 ? line.slice(ci + 1).trim() : '') || attrs['tvg-name'] || 'Kanalas',
+        group: attrs['group-title'] || '',
+        logo: attrs['tvg-logo'] || '',
+        // tvg-id doubles as the iptvx.one EPG slug ([a-z0-9-]); empty = no guide
+        epg: /^[a-z0-9-]+$/.test(attrs['tvg-id'] || '') ? attrs['tvg-id'] : '',
+      };
+    } else if (line.startsWith('#')) {
+      continue; // header, separators, comments
+    } else {
+      channels.push({ ...(meta || { name: line, group: '', logo: '', epg: '' }), url: line });
+      meta = null;
+    }
+  }
+  return channels;
+}
+
+function loadIptv() {
+  let st;
+  try { st = fs.statSync(IPTV_FILE); } catch { return { channels: [], groups: [], missing: true }; }
+  if (st.mtimeMs !== iptvCache.mtime) {
+    const channels = parseM3U(fs.readFileSync(IPTV_FILE, 'utf8'));
+    const groups = [];
+    const byName = new Map();
+    channels.forEach((c, i) => {
+      c.idx = i;
+      const g = c.group || 'Kiti';
+      if (!byName.has(g)) {
+        byName.set(g, []);
+        groups.push({ name: g, channels: byName.get(g) });
+      }
+      byName.get(g).push(c);
+    });
+    iptvCache = { mtime: st.mtimeMs, channels, groups };
+  }
+  return iptvCache;
+}
+
+// sign proxied URLs so /tvproxy only serves what we minted (no open proxy)
+function tvSig(u) {
+  return crypto.createHash('sha256').update(`tv|${u}|${authToken}`).digest('hex').slice(0, 16);
+}
+function tvProxyUrl(u) {
+  return `/tvproxy?u=${enc(u)}&s=${tvSig(u)}`;
+}
+
+// route every URI in an HLS playlist (segments, variant playlists, keys,
+// alternate audio) back through /tvproxy, resolved against the final URL
+function rewriteM3U8(body, baseUrl) {
+  const absProxy = (u) => {
+    try { return tvProxyUrl(new URL(u, baseUrl).href); } catch { return u; }
+  };
+  return body.split(/\r?\n/).map(line => {
+    const t = line.trim();
+    if (!t) return line;
+    if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (_, u) => `URI="${absProxy(u)}"`);
+    return absProxy(t);
+  }).join('\n');
+}
+
+function youtubeId(u) {
+  const m = String(u).match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|live\/|shorts\/)|youtu\.be\/)([\w-]{6,})/);
+  return m ? m[1] : null;
+}
+
+// embed/player pages (play.tv3.lt ir pan.) go straight into an iframe instead
+// of the video proxy; an explicit "iframe:" prefix in the m3u forces this
+function iframeSrcOf(u) {
+  if (/^iframe:/i.test(u)) return u.slice(7);
+  return /\/embed[-/]|\.html?(\?|$)/i.test(u) ? u : null;
+}
+
+/* ------------------------------- EPG (iptvx.one) -----------------------------
+   The channel's tvg-id is an iptvx.one slug; we scrape its program page
+   (https://epg.iptvx.one/id/<slug>) into a flat list of {start,title,desc}.
+   Times on that page are Vilnius-local, which is what the TV/iPad shows, so we
+   return them as naive local datetimes and let the client pick "now". Cached
+   per slug; the source itself only refreshes about hourly. */
+
+const EPG_BASE = 'https://epg.iptvx.one/id/';
+const EPG_TTL = 30 * 60 * 1000;
+const epgCache = new Map();
+const RU_MONTHS = {
+  'января': '01', 'февраля': '02', 'марта': '03', 'апреля': '04', 'мая': '05', 'июня': '06',
+  'июля': '07', 'августа': '08', 'сентября': '09', 'октября': '10', 'ноября': '11', 'декабря': '12',
+};
+
+function parseEpgHtml(html) {
+  const $ = cheerio.load(html);
+  const programs = [];
+  $('section.panel').each((_, sec) => {
+    const head = $(sec).prevAll('h3').first().text().trim();
+    const m = head.match(/(\d{1,2})\s+([а-яё]+)\s+(\d{4})/i);
+    if (!m) return;
+    const date = `${m[3]}-${RU_MONTHS[m[2].toLowerCase()] || '01'}-${String(m[1]).padStart(2, '0')}`;
+    $(sec).find('.prog_id').each((__, p) => {
+      const time = $(p).find('.prog_time').text().trim();
+      const title = $(p).find('.prog_title').text().trim();
+      if (!/^\d{1,2}:\d{2}$/.test(time) || !title) return;
+      const desc = $(p).nextAll('.prog_desc').first().text().trim();
+      programs.push({ start: `${date}T${time.padStart(5, '0')}`, title, desc: desc.slice(0, 400) });
+    });
+  });
+  return programs;
+}
+
+const epgPending = new Map();
+async function getEpg(slug) {
+  if (!/^[a-z0-9-]+$/.test(slug)) return null;
+  const hit = epgCache.get(slug);
+  if (hit && hit.exp > Date.now()) return hit.data;
+  // collapse concurrent fetches for the same slug (the /tv grid asks for many at once)
+  if (epgPending.has(slug)) return epgPending.get(slug);
+  const p = (async () => {
+    const res = await fetch(EPG_BASE + slug, { headers: { 'User-Agent': UA, 'Accept-Language': 'lt' } });
+    if (!res.ok) throw new Error(`EPG ${res.status}`);
+    const programs = parseEpgHtml(await res.text());
+    epgCache.set(slug, { data: programs, exp: Date.now() + EPG_TTL });
+    return programs;
+  })();
+  epgPending.set(slug, p);
+  try { return await p; } finally { epgPending.delete(slug); }
+}
+
+// current Europe/Vilnius wall-clock as "YYYY-MM-DDTHH:MM" — directly comparable
+// to the program start strings (which are Vilnius-local), regardless of server tz
+function vilniusNow() {
+  const s = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Vilnius', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date());
+  return s.replace(' ', 'T');
+}
+
+// {now, next} for a sorted program list, or null if no schedule
+function epgNowNext(programs) {
+  if (!programs || !programs.length) return null;
+  const now = vilniusNow();
+  let cur = -1;
+  for (let i = 0; i < programs.length; i++) { if (programs[i].start <= now) cur = i; else break; }
+  const fmt = (p) => p ? { time: p.start.slice(11, 16), title: p.title } : null;
+  return { now: cur >= 0 ? fmt(programs[cur]) : null, next: fmt(programs[cur + 1]) };
+}
+
 /* --------------------------------- helpers --------------------------------- */
 
 function esc(s) {
@@ -638,6 +825,7 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
     ['/', 'Pradžia', 'home'],
     ['/filmai', 'Filmai', 'filmai'],
     ['/serialai', 'Serialai', 'serialai'],
+    ['/tv', 'TV', 'tv'],
   ].map(([href, label, key]) =>
     `<a class="navlink${active === key ? ' active' : ''}" href="${href}">${label}</a>`).join('');
   return `<!DOCTYPE html>
@@ -842,6 +1030,156 @@ app.get('/search', async (req, res) => {
   } catch (e) { errorPage(res, e); }
 });
 
+/* -------------------------------- TV routes -------------------------------- */
+
+function channelAbbr(name) {
+  const clean = String(name).replace(/\(.*?\)/g, '').trim();
+  if (clean.length <= 5) return clean.toUpperCase();
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length === 1) return clean.slice(0, 3).toUpperCase();
+  return words.slice(0, 3).map(w => w[0]).join('').toUpperCase();
+}
+
+function channelTile(c) {
+  // stable per-name hue so tiles without a logo still look distinct
+  let h = 0;
+  for (const ch of c.name) h = (h * 31 + ch.codePointAt(0)) % 360;
+  const icon = c.logo
+    ? `<img class="ch-logo" loading="lazy" src="${esc(c.logo)}" alt="" onerror="this.outerHTML='<span class=&quot;ch-abbr&quot;>${esc(channelAbbr(c.name))}</span>'">`
+    : `<span class="ch-abbr" style="background:hsl(${h},45%,30%)">${esc(channelAbbr(c.name))}</span>`;
+  // now/next programme placeholders, filled client-side from /tv/epg-now
+  const epg = c.epg
+    ? `<div class="ch-epg" data-epg="${esc(c.epg)}"><div class="ch-now"></div><div class="ch-next"></div></div>`
+    : '';
+  return `
+    <a class="ch" href="/tv/play?c=${c.idx}">
+      <span class="ch-no">${c.idx + 1}</span>
+      ${icon}
+      <span class="ch-name">${esc(c.name)}</span>
+      ${epg}
+    </a>`;
+}
+
+app.get('/tv', (req, res) => {
+  const { groups, missing } = loadIptv();
+  const srcId = activeSourceId(req);
+  const opts = { active: 'tv', source: srcId ? SOURCES[srcId].name : '' };
+  if (missing) {
+    return res.send(layout('TV', `
+      <div class="errorbox">
+        <h1>Nerastas kanalų failas</h1>
+        <p>Nepavyko sukurti <code>${esc(IPTV_FILE)}</code>. Patikrink, ar yra <code>${esc(IPTV_DEFAULT)}</code>, arba įkelk kanalų sąrašą rankiniu būdu.</p>
+      </div>`, opts));
+  }
+  const body = (groups.map(g => `
+    <h2 class="section-title">${esc(g.name)} <small class="count">${g.channels.length}</small></h2>
+    <div class="chgrid">${g.channels.map(channelTile).join('')}</div>`).join('')
+    || `<p class="empty">Kanalų sąrašas tuščias — papildyk iptv.m3u failą.</p>`)
+    + `\n<script src="/epg-grid.js"></script>`;
+  res.send(layout('TV kanalai', body, opts));
+});
+
+app.get('/tv/play', (req, res) => {
+  const { channels } = loadIptv();
+  const i = parseInt(req.query.c, 10);
+  const c = channels[i];
+  if (!c) return res.redirect('/tv');
+
+  const zap = (j, label) => channels[j]
+    ? `<a class="btn alt zap" href="/tv/play?c=${j}" title="${esc(channels[j].name)}">${label}</a>` : '';
+  const buttons = zap(i - 1, '‹') + zap(i + 1, '›');
+
+  const yt = youtubeId(c.url);
+  const ifr = yt ? null : iframeSrcOf(c.url);
+  const inner = yt
+    ? `<iframe class="playerframe" src="https://www.youtube-nocookie.com/embed/${esc(yt)}?autoplay=1&playsinline=1" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe>`
+    : ifr
+    ? `<iframe class="playerframe" src="${esc(ifr)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`
+    : `<video id="tvvideo" class="playerframe" controls autoplay playsinline></video>
+    <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
+    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti kanalo. <a href="">Bandyti dar kartą</a></div>
+    <script src="/hls.min.js"></script>
+    <script src="/iptv.js"></script>
+    <script>initIptv(${JSON.stringify(tvProxyUrl(c.url))});</script>`;
+
+  res.send(playerShell(c.name, '/tv', inner, buttons, '', c.epg || ''));
+});
+
+// current + next programme for every channel that has a guide, as one compact
+// JSON map keyed by slug — the /tv grid fetches this once and fills in tiles
+app.get('/tv/epg-now', async (req, res) => {
+  const { channels } = loadIptv();
+  const slugs = [...new Set(channels.map(c => c.epg).filter(Boolean))];
+  const out = {};
+  await Promise.all(slugs.map(async (slug) => {
+    try { out[slug] = epgNowNext(await getEpg(slug)); } catch { out[slug] = null; }
+  }));
+  res.setHeader('Cache-Control', 'public, max-age=120');
+  res.json(out);
+});
+
+// EPG schedule for one channel (iptvx.one slug), as JSON for the player sidebar
+app.get('/tv/epg', async (req, res) => {
+  const id = (req.query.id || '').toString();
+  if (!/^[a-z0-9-]+$/.test(id)) return res.status(400).json({ error: 'bad id' });
+  try {
+    const programs = await getEpg(id);
+    res.setHeader('Cache-Control', 'public, max-age=600');
+    res.json({ id, programs: programs || [] });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+/* HLS-aware proxy: playlists get their URIs rewritten back through here,
+   everything else (segments, keys, direct mp4/radio) is piped through. */
+app.get('/tvproxy', async (req, res) => {
+  const u = (req.query.u || '').toString();
+  const s = (req.query.s || '').toString();
+  if (!u || s !== tvSig(u)) return res.status(403).end();
+  try {
+    // No Referer: these CDNs all serve fine without one, and a self-origin
+    // Referer actively breaks some (e.g. dcdn.lt answers 204 to it).
+    const headers = { 'User-Agent': UA, 'Accept': '*/*' };
+    if (req.headers.range) headers.Range = req.headers.range;
+    const up = await fetch(u, { headers, redirect: 'follow' });
+    if (!up.ok && up.status !== 206) return res.status(up.status === 404 ? 404 : 502).end();
+    const finalUrl = up.url || u;
+    const ct = (up.headers.get('content-type') || '').toLowerCase();
+    const looksTexty = /mpegurl|json|text|octet-stream/.test(ct) || /\.(m3u8?|php)(\?|$)/i.test(new URL(finalUrl).pathname);
+
+    if (looksTexty) {
+      const body = await up.text();
+      if (body.trimStart().startsWith('#EXTM3U')) {
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-store');
+        return res.send(rewriteM3U8(body, finalUrl));
+      }
+      // JSON wrapper (LRT get_live_url.php, tv3 playlist API, …) — pull the real
+      // HLS url out. Handles \/ escaping and protocol-relative //host urls, and
+      // prefers a plain HLS source over DRM/Verimatrix (VMX) variants.
+      const urls = body.replace(/\\\//g, '/').match(/(?:https?:)?\/\/[^"'\s\\]+?\.m3u8[^"'\s\\]*/gi) || [];
+      const pick = urls.find(u => /GO3_LIVE_HLS/.test(u)) || urls.find(u => !/VMX|nHLS/i.test(u)) || urls[0];
+      if (pick) return res.redirect(tvProxyUrl(pick.startsWith('//') ? 'https:' + pick : pick));
+      // not a playlist after all (e.g. small text/binary file) — pass through
+      res.status(up.status);
+      if (ct) res.setHeader('Content-Type', ct);
+      return res.send(body);
+    }
+
+    res.status(up.status);
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+      const v = up.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    if (!up.body) return res.end();
+    Readable.fromWeb(up.body).pipe(res);
+  } catch (e) {
+    res.status(502).end();
+  }
+});
+
 app.get('/t/:type(filmas|serialai|movie|tv)/:id', async (req, res) => {
   const { type, id } = req.params;
   const provider = PROVIDER_BY_TYPE[type];
@@ -898,7 +1236,21 @@ app.get('/play', async (req, res) => {
   } catch (e) { errorPage(res, e, back); }
 });
 
-function playerShell(title, back, inner, extraBtn = '', note = '') {
+function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
+  const box = `<div class="player-box">${inner}
+  </div>`;
+  const stage = epg
+    ? `<div class="player-stage with-epg">
+  <div class="player-main">${box}</div>
+  <aside class="epg-panel">
+    <div class="epg-title">Programa</div>
+    <div id="epg-list" class="epg-list" data-epg="${esc(epg)}"><div class="epg-msg">Kraunama…</div></div>
+  </aside>
+</div>
+<script src="/epg.js"></script>`
+    : `<div class="player-stage">
+  ${box}
+</div>`;
   return `<!DOCTYPE html>
 <html lang="lt">
 <head>
@@ -915,10 +1267,7 @@ function playerShell(title, back, inner, extraBtn = '', note = '') {
   ${extraBtn}
 </div>
 ${note}
-<div class="player-stage">
-  <div class="player-box">${inner}
-  </div>
-</div>
+${stage}
 <script src="/tv.js"></script>
 </body>
 </html>`;
