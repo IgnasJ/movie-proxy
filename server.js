@@ -695,8 +695,10 @@ const EIGHT = {
 // query TMDB ourselves. Works on any server with a free TMDB_API_KEY, no browser.
 const WL_SERVERS = [
   { id: 1, name: 'Serveris 1', tag: 'VidSrc',
-    movie: id => `https://vidsrc-embed.ru/embed/movie?tmdb=${id}`,
-    tv: (id, s, e) => `https://vidsrc-embed.ru/embed/tv?tmdb=${id}&season=${s}&episode=${e}` },
+    // ds_lang preselects the subtitle language in the VidSrc player; without
+    // it the player starts with subtitles off
+    movie: (id, sub) => `https://vidsrc-embed.ru/embed/movie?tmdb=${id}${sub ? `&ds_lang=${sub}` : ''}`,
+    tv: (id, s, e, sub) => `https://vidsrc-embed.ru/embed/tv?tmdb=${id}&season=${s}&episode=${e}${sub ? `&ds_lang=${sub}` : ''}` },
   { id: 2, name: 'Serveris 2', tag: 'MoviesAPI',
     movie: id => `https://moviesapi.to/movie/${id}`,
     tv: (id, s, e) => `https://moviesapi.to/tv/${id}-${s}-${e}` },
@@ -773,6 +775,8 @@ const WL = {
       return {
         kind: 'movie', backUrl, title,
         original: (m.original_title && m.original_title !== title) ? m.original_title : '',
+        // numeric imdb id (no "tt") — the LT-subtitle check queries OpenSubtitles with it
+        imdbId: (m.imdb_id || '').replace(/^tt/, ''),
         poster: wlImg(m.poster_path), year: String(m.release_date || '').slice(0, 4), imdb: '',
         runtime: m.runtime ? `${m.runtime} min` : '', lang: (m.original_language || '').toUpperCase(),
         genres: (m.genres || []).map(g => g.name),
@@ -781,7 +785,7 @@ const WL = {
         servers: WL_SERVERS.map(s => ({ name: s.name, tag: s.tag, play: pl(s.id) })),
       };
     }
-    const t = await tmdb('/tv/' + enc(id));
+    const t = await tmdb('/tv/' + enc(id) + '?append_to_response=external_ids');
     if (!t || !t.id) throw new Error('Serialas nerastas');
     const title = t.name || t.original_name || '';
     const episodes = [];
@@ -802,6 +806,7 @@ const WL = {
     return {
       kind: 'series', backUrl, title,
       original: (t.original_name && t.original_name !== title) ? t.original_name : '',
+      imdbId: ((t.external_ids && t.external_ids.imdb_id) || '').replace(/^tt/, ''),
       poster: wlImg(t.poster_path), year: String(t.first_air_date || '').slice(0, 4), imdb: '',
       runtime: t.number_of_seasons ? `${t.number_of_seasons} sez.` : '', lang: (t.original_language || '').toUpperCase(),
       genres: (t.genres || []).map(g => g.name),
@@ -809,9 +814,10 @@ const WL = {
       description: t.overview || '', cast: [], episodes,
     };
   },
-  play({ kind, id, server, season, episode }) {
+  play({ kind, id, server, season, episode, sub }) {
     const s = WL_SERVERS.find(x => String(x.id) === String(server)) || WL_SERVERS[0];
-    return kind === 'tv' ? s.tv(id, season, episode) : s.movie(id);
+    const lang = (sub === 'lt' || sub === 'en') ? sub : ''; // default: subtitles off
+    return kind === 'tv' ? s.tv(id, season, episode, lang) : s.movie(id, lang);
   },
 };
 
@@ -925,12 +931,19 @@ function detailPage(d, sourceName) {
         ${d.runtime ? `<span class="chip">${esc(d.runtime)}</span>` : ''}
         ${d.lang ? `<span class="chip">${esc(d.lang)}</span>` : ''}
         ${d.rating ? `<span class="chip">★ ${esc(d.rating)}${d.votes ? ` (${esc(d.votes)})` : ''}</span>` : ''}
+        ${d.imdbId ? `<span class="chip subs-chip" id="lt-subs" hidden></span>` : ''}
       </div>
       ${d.genres.length ? `<div class="meta-row">${d.genres.map(g => `<span class="chip genre">${esc(g)}</span>`).join('')}</div>` : ''}
       ${wrec ? `<div class="meta-row"><span class="chip watched">✓ Žiūrėta</span></div>` : ''}
       ${d.description ? `<p class="desc">${esc(d.description)}</p>` : ''}
     </div>
   </div>
+  ${d.imdbId ? `<div class="meta-row subs-row" id="sub-pick">
+    <span class="subs-label">Subtitrai:</span>
+    <button type="button" class="chip subs-pick active" data-sub="off">Išjungta</button>
+    <button type="button" class="chip subs-pick" data-sub="en">EN</button>
+    <button type="button" class="chip subs-pick" data-sub="lt" hidden>LT</button>
+  </div>` : ''}
   ${sources}
   ${d.cast && d.cast.length ? `<h2 class="section-title">Vaidina</h2>
   <div class="cast">` + d.cast.map(c => `
@@ -938,7 +951,46 @@ function detailPage(d, sourceName) {
       <img loading="lazy" src="${esc(c.img)}" alt="">
       <div class="person-name">${esc(c.name)}</div>
       <div class="person-role">${esc(c.role)}</div>
-    </div>`).join('') + `</div>` : ''}`;
+    </div>`).join('') + `</div>` : ''}
+  ${d.imdbId ? `<script>
+  /* The VidSrc player pulls its subtitle list from the free OpenSubtitles REST
+     API by imdb id — query the same endpoint to show whether LT subs exist
+     (the LT button appears only then). The picker choice is written into every
+     play link as &sub=, which /play turns into the embed's ds_lang; the
+     default is off (no ds_lang — the player starts without subtitles). */
+  (function () {
+    var el = document.getElementById('lt-subs');
+    var pick = document.getElementById('sub-pick');
+    fetch('https://rest.opensubtitles.org/search/imdbid-${esc(d.imdbId)}/sublanguageid-lit')
+      .then(function (r) { return r.json(); })
+      .then(function (a) {
+        var yes = a && a.length;
+        el.textContent = yes ? '✓ LT subtitrai' : 'LT subtitrų nėra';
+        el.className = 'chip subs-chip ' + (yes ? 'subs-yes' : 'subs-no');
+        el.hidden = false;
+        if (yes) pick.querySelector('button[data-sub="lt"]').hidden = false;
+      })
+      .catch(function () {});
+
+    pick.addEventListener('click', function (e) {
+      var b = e.target;
+      if (!b.getAttribute || !b.getAttribute('data-sub')) return;
+      var code = b.getAttribute('data-sub');
+      var btns = pick.querySelectorAll('button[data-sub]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].className = 'chip subs-pick' + (btns[i] === b ? ' active' : '');
+      }
+      var links = document.querySelectorAll('a.btn.srv');
+      for (var j = 0; j < links.length; j++) {
+        var href = links[j].getAttribute('href');
+        if (href.indexOf('/play?') !== 0) continue;
+        if (href.indexOf('sub=') !== -1) href = href.replace(/([?&])sub=[a-z]+/, '$1sub=' + code);
+        else href += '&sub=' + code;
+        links[j].setAttribute('href', href);
+      }
+    });
+  })();
+  </script>` : ''}`;
   return layout(d.title, body, { source: sourceName });
 }
 

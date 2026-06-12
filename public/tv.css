@@ -207,6 +207,22 @@ main { padding: 1rem 2rem 3rem; max-width: 1700px; margin: 0 auto; }
 }
 .chip.genre { background: #243042; }
 .chip.watched { background: #1f7a33; color: #fff; }
+.chip.subs-yes { background: #1f7a33; color: #fff; }
+.chip.subs-no { color: #8e919c; }
+
+/* subtitle language picker (shown only when LT subs exist) */
+.subs-row { align-items: center; margin: 1rem 0 0; }
+.subs-label { color: #b8bac2; font-weight: 600; }
+button.chip.subs-pick {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.95rem;
+  padding: 0.35rem 0.9rem;
+  background: #2a2d38;
+  color: #b8bac2;
+}
+button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
 
 /* watched markers */
 .badge.watched {
