@@ -20,6 +20,19 @@ if (process.env.INSECURE_TLS === '1') {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 
+// Cache-busting for static assets: append the file's mtime so a changed
+// css/js gets a new URL and browsers fetch it instead of a stale cached copy
+// (the files are still cached long; the ?v= just changes when they change).
+const _assetVer = new Map();
+function asset(p) {
+  if (!_assetVer.has(p)) {
+    try { _assetVer.set(p, Math.floor(fs.statSync(path.join(__dirname, 'public', p)).mtimeMs)); }
+    catch { _assetVer.set(p, 0); }
+  }
+  const v = _assetVer.get(p);
+  return v ? `${p}?v=${v}` : p;
+}
+
 const app = express();
 app.disable('x-powered-by');
 
@@ -44,7 +57,7 @@ function loginPage({ error = false, next = '/' } = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Prisijungimas</title>
-<link rel="stylesheet" href="/tv.css">
+<link rel="stylesheet" href="${asset('/tv.css')}">
 </head>
 <body class="loginpage">
 <form class="login-card" action="/login" method="post">
@@ -59,7 +72,7 @@ function loginPage({ error = false, next = '/' } = {}) {
   </label>
   <button type="submit">Prisijungti</button>
 </form>
-<script src="/tv.js"></script>
+<script src="${asset('/tv.js')}"></script>
 </body>
 </html>`;
 }
@@ -835,7 +848,7 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>${esc(title)}</title>
-<link rel="stylesheet" href="/tv.css">
+<link rel="stylesheet" href="${asset('/tv.css')}">
 </head>
 <body>
 <header class="topbar">
@@ -851,7 +864,7 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
 <main>
 ${body}
 </main>
-<script src="/tv.js"></script>
+<script src="${asset('/tv.js')}"></script>
 </body>
 </html>`;
 }
@@ -1075,7 +1088,7 @@ app.get('/tv', (req, res) => {
     <h2 class="section-title">${esc(g.name)} <small class="count">${g.channels.length}</small></h2>
     <div class="chgrid">${g.channels.map(channelTile).join('')}</div>`).join('')
     || `<p class="empty">Kanalų sąrašas tuščias — papildyk iptv.m3u failą.</p>`)
-    + `\n<script src="/epg-grid.js"></script>`;
+    + `\n<script src="${asset('/epg-grid.js')}"></script>`;
   res.send(layout('TV kanalai', body, opts));
 });
 
@@ -1098,8 +1111,8 @@ app.get('/tv/play', (req, res) => {
     : `<video id="tvvideo" class="playerframe" controls autoplay playsinline></video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti kanalo. <a href="">Bandyti dar kartą</a></div>
-    <script src="/hls.min.js"></script>
-    <script src="/iptv.js"></script>
+    <script src="${asset('/hls.min.js')}"></script>
+    <script src="${asset('/iptv.js')}"></script>
     <script>initIptv(${JSON.stringify(tvProxyUrl(c.url))});</script>`;
 
   res.send(playerShell(c.name, '/tv', inner, buttons, '', c.epg || ''));
@@ -1247,7 +1260,7 @@ function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
     <div id="epg-list" class="epg-list" data-epg="${esc(epg)}"><div class="epg-msg">Kraunama…</div></div>
   </aside>
 </div>
-<script src="/epg.js"></script>`
+<script src="${asset('/epg.js')}"></script>`
     : `<div class="player-stage">
   ${box}
 </div>`;
@@ -1258,7 +1271,7 @@ function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>${esc(title)}</title>
-<link rel="stylesheet" href="/tv.css">
+<link rel="stylesheet" href="${asset('/tv.css')}">
 </head>
 <body class="playerpage">
 <div class="playerbar">
@@ -1268,7 +1281,7 @@ function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
 </div>
 ${note}
 ${stage}
-<script src="/tv.js"></script>
+<script src="${asset('/tv.js')}"></script>
 </body>
 </html>`;
 }
