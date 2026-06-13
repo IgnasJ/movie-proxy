@@ -278,6 +278,7 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
 .btn.srv { background: #2e7d32; color: #fff; }
 .btn.srv small { opacity: 0.75; font-weight: 400; }
 .btn.srv.trailer { background: #8e2430; }
+.btn.srv.adfree { background: #e5a00d; color: #14151a; }
 .episode {
   display: flex;
   align-items: center;

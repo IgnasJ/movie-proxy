@@ -625,28 +625,27 @@ async function resolveClean(embedUrl) {
   return null;
 }
 
-/* ------------------------------ DoodStream bypass ----------------------------
-   DoodStream refuses to play when sandboxed, so we can't block its popups that
-   way. Instead, for dood hosts we offer a "bypass" that replicates dood's own
-   pass_md5 token handshake server-side to get the direct MP4, then plays it in
-   our own <video> via /stream (which proxies the bytes with the required
-   Referer). This skips dood's ad page entirely. Fragile by nature — dood rotates
-   the scheme periodically; falls back to the normal iframe when it stops working. */
+/* ------------------------------ Streamtape bypass ----------------------------
+   Streamtape wraps its player in pop-up / redirect ads. Its direct-link scheme
+   is simple and (unlike DoodStream) not Cloudflare-gated: the embed page builds
+   a /get_video URL from a lightly-obfuscated string whose junk prefix is sliced
+   off with .substring(). We rebuild that URL server-side and play the resulting
+   MP4 in our own <video> via /stream. The token is bound to the requesting IP,
+   so playback must go through our proxy (the same IP that minted the token).
+   Fragile by nature — falls back to the normal iframe if the scheme changes.
 
-const DOOD_RE = /(^|\.)(dood|do0+d|ds2play|ds2video|d0{2,}d|vidply|doods)\b|dood|ds2(play|video)|d0{3,}d/i;
-function isDoodHost(host) { return DOOD_RE.test(host || ''); }
+   (DoodStream used to have an equivalent bypass, but its mirrors now sit behind a
+   Cloudflare *managed* JS challenge that can't be solved server-side, so it was
+   removed.) */
 
-function randStr(n) {
-  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let s = '';
-  for (let i = 0; i < n; i++) s += c[crypto.randomInt(c.length)];
-  return s;
+function isStreamtapeHost(host) {
+  return /streamtape|str[ae]?tape|stape|tapecontent|streamadblock/i.test(host || '');
 }
 
-// dood's HTML pages sit behind Cloudflare, which 403s Node's fetch (flagged TLS
-// fingerprint). The system curl binary passes, so we use it for the text fetches.
-// curl -w appends the final (post-redirect) URL after a marker so we can recover
-// the rotating mirror origin (dood.pm -> playmogo.com, etc.).
+// Some embed hosts 403 Node's fetch (flagged TLS fingerprint) but allow the
+// system curl binary, so we use curl for the text fetches. -w appends the final
+// (post-redirect) URL after a marker so we can recover the real origin after any
+// mirror redirect.
 const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
 function curlFetch(url, referer) {
   return new Promise((resolve, reject) => {
@@ -660,20 +659,33 @@ function curlFetch(url, referer) {
   });
 }
 
-// embed url (https://dood.x/e/<id>) -> { url: direct mp4, referer }
-async function resolveDoodMp4(embedUrl) {
-  const start = embedUrl.replace('/d/', '/e/');
+// embed url (https://streamtape.com/e/<id>) -> { url: direct mp4, referer }
+// The page sets: getElementById('robotlink').innerHTML =
+//   '//streamtape.com/' + ('<junk>get_video?id=...&token=...').substring(n)[.substring(m)]
+// Strip the junk prefix per the .substring() calls, then prepend the scheme.
+async function resolveStreamtapeMp4(embedUrl) {
+  const start = embedUrl.replace('/v/', '/e/');
   const { body: page, finalUrl } = await curlFetch(start, new URL(start).origin + '/');
   const origin = new URL(finalUrl).origin;
-  const m = page.match(/\/pass_md5\/[\w-]+\/[\w-]+/);
-  if (!m) return null;
-  const passPath = m[0];
-  const token = passPath.split('/').pop();
-  const { body } = await curlFetch(origin + passPath, finalUrl);
-  const base = body.trim();
-  if (!/^https?:\/\//.test(base)) return null;
-  const mp4 = `${base}${randStr(10)}?token=${token}&expiry=${Date.now()}`;
-  return { url: mp4, referer: origin + '/' };
+
+  const build = (prefix, inner, subs) => {
+    for (const sm of subs.matchAll(/\.substring\((\d+)\)/g)) inner = inner.substring(parseInt(sm[1], 10));
+    const path = prefix + inner;                       // //streamtape.com/get_video?...
+    if (!/get_video\?id=/.test(path)) return null;
+    let url = path.startsWith('//') ? 'https:' + path : path.startsWith('http') ? path : origin + path;
+    if (!/[?&]stream=1\b/.test(url)) url += '&stream=1';
+    return url;
+  };
+
+  // Prefer #robotlink (the element Streamtape's own player reads); the page also
+  // sprinkles decoy elements, so fall back to scanning every innerHTML concat.
+  const rl = page.match(/getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]*)['"]\s*\+\s*\(\s*['"]([^'"]+)['"]\s*\)((?:\s*\.substring\(\d+\))+)/i);
+  if (rl) { const u = build(rl[1], rl[2], rl[3]); if (u) return { url: u, referer: origin + '/' }; }
+
+  const re = /innerHTML\s*=\s*['"]([^'"]*)['"]\s*\+\s*\(\s*['"]([^'"]+)['"]\s*\)((?:\s*\.substring\(\d+\))+)/gi;
+  let m;
+  while ((m = re.exec(page))) { const u = build(m[1], m[2], m[3]); if (u) return { url: u, referer: origin + '/' }; }
+  return null;
 }
 
 // sign a /stream target so the proxy only serves URLs we minted (no open proxy)
@@ -963,8 +975,14 @@ function detailPage(d, sourceName) {
 
   let sources = '';
   if (d.kind === 'movie') {
+    // ad-free shortcut: launch the Streamtape server straight into bypass mode,
+    // shown before the trailer button so it's the first thing offered.
+    const stapeSrv = (d.servers || []).find(s => /STREAMT/i.test(s.tag || ''));
+    const adFreeBtn = stapeSrv
+      ? `<a class="btn srv adfree" href="${esc(stapeSrv.play + '&bypass=1')}">▶ Be reklamų</a>`
+      : '';
     sources = `<h2 class="section-title">Šaltiniai</h2>
-    <div class="srvlist">` + (d.servers || []).map(s => `
+    <div class="srvlist">` + adFreeBtn + (d.servers || []).map(s => `
       <a class="btn srv${s.isTrailer ? ' trailer' : ''}" href="${esc(s.play)}">
         ▶ ${esc(s.name || 'Serveris')}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}
       </a>`).join('') + `</div>`;
@@ -1411,12 +1429,12 @@ app.get('/play', async (req, res) => {
     const src = await provider.play(req.query);
     if (!src) throw new Error('Nepavyko gauti grotuvo nuorodos');
 
-    const dood = isDoodHost(new URL(src).host);
+    const stape = isStreamtapeHost(new URL(src).host);
     const wantBypass = req.query.bypass === '1';
 
-    // --- DoodStream bypass: extract the direct MP4 and play it ourselves ---
-    if (dood && wantBypass) {
-      const direct = await resolveDoodMp4(src);
+    // --- Streamtape bypass: extract the direct MP4 and play it ourselves ---
+    if (stape && wantBypass) {
+      const direct = await resolveStreamtapeMp4(src);
       if (direct) {
         const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
         return res.send(playerShell(title, back, `
@@ -1425,10 +1443,10 @@ app.get('/play', async (req, res) => {
       // extraction failed — fall through to the normal iframe with a note
     }
 
-    const bypassBtn = dood && !wantBypass
+    const bypassBtn = stape && !wantBypass
       ? `<a class="btn alt" href="/play?${esc(new URLSearchParams({ ...req.query, bypass: '1' }).toString())}">Be reklamų (bandyti)</a>`
       : '';
-    const note = dood && wantBypass
+    const note = stape && wantBypass
       ? `<div class="player-note">Nepavyko apeiti reklamų — rodomas originalus grotuvas.</div>` : '';
 
     res.send(playerShell(title, back, `
