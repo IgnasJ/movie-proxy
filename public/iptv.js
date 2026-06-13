@@ -11,14 +11,40 @@
    <video> otherwise (iPhone/iPad Safari play HLS natively). If hls.js can't
    parse the manifest (plain mp4 / radio stream), fall back to a direct src.
    Autoplay with sound is often blocked until a gesture, so a tap-to-play
-   overlay appears when play() is rejected. */
-function initIptv(directUrl, proxyUrl) {
+   overlay appears when play() is rejected.
+
+   Some "clean" HLS feeds turn DRM-encrypted at times (e.g. Go3 applies
+   SAMPLE-AES/FairPlay to TV6 during live sports). hls.js can't decrypt those —
+   it downloads every segment but finds no media, and would otherwise spin
+   forever. When that's detected and the channel declares a licensed `embedUrl`,
+   we swap the <video> for that embed iframe (its own player negotiates
+   Widevine/PlayReady/FairPlay per browser). It reverts to clean HLS on its own
+   once the encryption is dropped. */
+function initIptv(directUrl, proxyUrl, embedUrl) {
   'use strict';
   var v = document.getElementById('tvvideo');
   var tap = document.getElementById('tvtap');
   var err = document.getElementById('tverr');
   var hls = null;
   var nativeActive = false;
+
+  // clean HLS is DRM-locked right now — hand off to the channel's licensed
+  // embed player; returns false when there's nothing to fall back to
+  function embedFallback() {
+    if (!embedUrl) return false;
+    if (hls) { hls.destroy(); hls = null; }
+    nativeActive = false;
+    var f = document.createElement('iframe');
+    f.className = 'playerframe';
+    f.src = embedUrl;
+    f.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
+    f.setAttribute('allowfullscreen', '');
+    f.setAttribute('referrerpolicy', 'no-referrer');
+    tap.hidden = true;
+    err.hidden = true;
+    if (v.parentNode) v.parentNode.replaceChild(f, v);
+    return true;
+  }
 
   // sources to try in order; the last entry is always the server proxy
   var queue = [];
@@ -91,8 +117,29 @@ function initIptv(directUrl, proxyUrl) {
       });
       var retries = 0;
       var parsed = false;
+      var parseErrs = 0;
+      var buffered = false;
+      // FairPlay SAMPLE-AES is signalled on the media playlist before any
+      // segment loads — catch it here for an instant, spinner-free swap
+      hls.on(Hls.Events.LEVEL_LOADED, function (_, data) {
+        var frags = data.details && data.details.fragments;
+        var dd = frags && frags.length && frags[0].decryptdata;
+        if (dd && dd.keyFormat === 'com.apple.streamingkeydelivery') {
+          if (embedFallback()) return;
+          fail(); // encrypted with no embed to fall back to — don't spin forever
+        }
+      });
+      hls.on(Hls.Events.FRAG_BUFFERED, function () { buffered = true; });
       hls.on(Hls.Events.ERROR, function (_, data) {
-        if (!data.fatal || !hls) return;
+        if (!hls) return;
+        // encrypted content hls.js can't depacketize floods non-fatal
+        // fragParsingErrors while nothing ever buffers — treat as DRM (backstop
+        // for key formats LEVEL_LOADED didn't flag)
+        if (data.details === Hls.ErrorDetails.FRAG_PARSING_ERROR) {
+          if (++parseErrs >= 3 && !buffered) { if (embedFallback()) return; fail(); }
+          return;
+        }
+        if (!data.fatal) return;
         // not an HLS playlist at all — let the browser try it directly
         if (data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR) return native(src);
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {

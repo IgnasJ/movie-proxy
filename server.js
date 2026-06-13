@@ -238,6 +238,9 @@ function parseM3U(text) {
         logo: attrs['tvg-logo'] || '',
         // tvg-id doubles as the iptvx.one EPG slug ([a-z0-9-]); empty = no guide
         epg: /^[a-z0-9-]+$/.test(attrs['tvg-id'] || '') ? attrs['tvg-id'] : '',
+        // licensed embed player to fall back to when the clean HLS turns out to
+        // be DRM-encrypted (e.g. SAMPLE-AES/FairPlay on sports) — see iptv.js
+        embed: attrs['tvg-embed'] || '',
       };
     } else if (line.startsWith('#')) {
       continue; // header, separators, comments
@@ -1165,7 +1168,7 @@ app.get('/tv/play', (req, res) => {
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti kanalo. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/hls.min.js')}"></script>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(c.url)}, ${JSON.stringify(tvProxyUrl(c.url))});</script>`;
+    <script>initIptv(${JSON.stringify(c.url)}, ${JSON.stringify(tvProxyUrl(c.url))}, ${JSON.stringify(c.embed || '')});</script>`;
 
   res.send(playerShell(c.name, '/tv', inner, buttons, '', c.epg || ''));
 });
