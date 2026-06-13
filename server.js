@@ -1201,13 +1201,16 @@ function activeProvider(req) {
 /* -------------------------------- rendering -------------------------------- */
 
 function layout(title, body, { query = '', active = '', source = '', hideNav = false } = {}) {
+  // IPTV (Live TV) mode hides the movie/series-only items (Filmai, Serialai and
+  // the search bar), since they don't apply to live channels.
+  const iptv = active === 'tv';
   const nav = hideNav ? '' : [
     ['/', 'Pradžia', 'home'],
     ['/filmai', 'Filmai', 'filmai'],
     ['/serialai', 'Serialai', 'serialai'],
     ['/sarasas', 'Sąrašas', 'wishlist'],
-    ['/tv', 'TV', 'tv'],
-  ].map(([href, label, key]) =>
+  ].filter(([, , key]) => !(iptv && (key === 'filmai' || key === 'serialai')))
+    .map(([href, label, key]) =>
     `<a class="navlink${active === key ? ' active' : ''}" href="${href}">${label}</a>`).join('');
   return `<!DOCTYPE html>
 <html lang="lt">
@@ -1226,10 +1229,10 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
 <header class="topbar">
   <a class="logo" href="/">🎬 Filmai</a>
   ${hideNav ? '' : `<nav>${nav}</nav>
-  <form class="search" action="/search" method="get">
+  ${iptv ? '' : `<form class="search" action="/search" method="get">
     <input type="search" name="q" placeholder="Ieškoti filmo ar serialo..." value="${esc(query)}" enterkeyhint="search">
     <button type="submit">Ieškoti</button>
-  </form>`}
+  </form>`}`}
   ${source ? `<a class="navlink source-switch" href="/sources" title="Keisti šaltinį">${esc(source)} ⇄</a>` : ''}
   <a class="navlink logout" href="/logout">Atsijungti</a>
 </header>
@@ -1424,7 +1427,10 @@ function errorPage(res, err, backUrl = '/') {
 /* ---------------------------------- routes --------------------------------- */
 
 app.get('/sources', (req, res) => {
-  const cur = activeSourceId(req);
+  // IPTV is "current" when it was the last thing picked (mpiptv flag, set by
+  // /set-source?src=iptv); otherwise the current movie source (mpsrc) is.
+  const iptvCurrent = /(?:^|;\s*)mpiptv=1\b/.test(req.headers.cookie || '');
+  const cur = iptvCurrent ? null : activeSourceId(req);
   const cards = Object.values(SOURCES).map(s => `
     <a class="source-card${cur === s.id ? ' active' : ''}" href="/set-source?src=${s.id}">
       <div class="source-emoji">${s.emoji}</div>
@@ -1432,18 +1438,36 @@ app.get('/sources', (req, res) => {
       <div class="source-desc">${esc(s.desc)}</div>
       ${cur === s.id ? `<div class="source-current">✓ Dabartinis</div>` : `<div class="source-pick">Pasirinkti</div>`}
     </a>`).join('');
+  // Live TV isn't a movie/series source, so it's not in SOURCES — it's a
+  // separate destination offered here instead of in the top nav.
+  const iptvCard = `
+    <a class="source-card iptv${iptvCurrent ? ' active' : ''}" href="/set-source?src=iptv">
+      <div class="source-emoji">📺</div>
+      <div class="source-name">IPTV</div>
+      <div class="source-desc">Tiesioginė televizija</div>
+      ${iptvCurrent ? `<div class="source-current">✓ Dabartinis</div>` : `<div class="source-pick">Pasirinkti</div>`}
+    </a>`;
   res.send(layout('Pasirink šaltinį', `
     <div class="sources-intro">
       <h1>Iš kur ieškoti?</h1>
-      <p>Pasirink filmų ir serialų šaltinį. Visada gali jį pakeisti viršuje.</p>
+      <p>Pasirink filmų ir serialų šaltinį arba žiūrėk tiesioginę televiziją. Visada gali jį pakeisti viršuje.</p>
     </div>
-    <div class="source-grid">${cards}</div>`, { hideNav: true }));
+    <div class="source-grid">${cards}${iptvCard}</div>`, { hideNav: true }));
 });
 
 app.get('/set-source', (req, res) => {
   const src = (req.query.src || '').toString();
+  // IPTV: remember it as the current selection (mpiptv) and open Live TV
+  if (src === 'iptv') {
+    res.setHeader('Set-Cookie', 'mpiptv=1; Path=/; Max-Age=31536000; SameSite=Lax');
+    return res.redirect('/tv');
+  }
   if (!SOURCES[src]) return res.redirect('/sources');
-  res.setHeader('Set-Cookie', `mpsrc=${src}; Path=/; Max-Age=31536000; SameSite=Lax`);
+  // a movie source becomes current, clearing the IPTV selection
+  res.setHeader('Set-Cookie', [
+    `mpsrc=${src}; Path=/; Max-Age=31536000; SameSite=Lax`,
+    'mpiptv=; Path=/; Max-Age=0; SameSite=Lax',
+  ]);
   res.redirect('/');
 });
 
@@ -1607,8 +1631,8 @@ function channelTile(c) {
 
 app.get('/tv', (req, res) => {
   const { groups, missing } = loadIptv();
-  const srcId = activeSourceId(req);
-  const opts = { active: 'tv', source: srcId ? SOURCES[srcId].name : '' };
+  // In IPTV the header's source-switch reflects IPTV, not the stored movie source
+  const opts = { active: 'tv', source: 'IPTV' };
   if (missing) {
     return res.send(layout('TV', `
       <div class="errorbox">
