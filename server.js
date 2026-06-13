@@ -10,6 +10,7 @@ const cheerio = require('cheerio');
 
 const PORT = process.env.PORT || 3000;
 const SOURCE = (process.env.SOURCE_URL || 'https://176.97.124.32').replace(/\/$/, '');
+const TOPFILMAI = (process.env.TOPFILMAI_URL || 'https://213.111.148.194').replace(/\/$/, '');
 const TMDB_KEY = process.env.TMDB_API_KEY || '';
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const enc = encodeURIComponent;
@@ -953,11 +954,239 @@ const WL = {
   },
 };
 
+// --- TOPfilmai (DataLife Engine; LT-dubbed catalog, direct-MP4 playback) ---
+// A custom DLE site (not DooPlay), so it gets its own cheerio parsers. The win
+// is playback: every title embeds Playerjs with a *direct* MP4 from the
+// filmaito.top CDN — movies as a single signed file, series as a JSON playlist
+// of episodes. No ad-wrapper, no embed host, no DRM. The CDN is Referer-locked,
+// so the browser can't fetch it itself; /play hands the MP4 to /stream (which
+// sets the Referer) and we play it in our own <video>. Movie URLs carry an
+// expiring token, so they're re-resolved from the (cached) detail page at click
+// time rather than baked into the catalog.
+
+// The CDN's Referer allowlist accepts this and the source IP, but NOT the
+// topfilmai.org domain (it 403s) — so we pin a constant independent of the
+// front-end host instead of deriving it from TOPFILMAI.
+const TF_STREAM_REFERER = 'https://filmaito.top/';
+
+async function tfGet(slug, ttlMs = 5 * 60 * 1000) {
+  const url = slug.startsWith('http') ? slug : TOPFILMAI + (slug.startsWith('/') ? slug : '/' + slug);
+  const key = 'tf:' + url;
+  const hit = cache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.html;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA, 'Referer': TOPFILMAI + '/', 'Accept-Language': 'lt,en;q=0.8' },
+    redirect: 'follow',
+  });
+  if (!res.ok) throw new Error(`Šaltinis grąžino ${res.status} (${url})`);
+  const html = await res.text();
+  cache.set(key, { html, exp: Date.now() + ttlMs });
+  return html;
+}
+
+function tfImg(src) {
+  if (!src) return '';
+  src = src.trim();
+  if (/^https?:/.test(src) || src.startsWith('data:')) return src;
+  return TOPFILMAI + (src.startsWith('/') ? src : '/' + src);
+}
+
+// kind from the card's first category chip ("Filmai"/"Serialai"/"Animacija");
+// "Animacija" alone is ambiguous, so fall back to a "… N sezonas" title check
+function tfCardKind($c) {
+  const first = ($c.find('.krasik__meta .flex-1').first().text().split(',')[0] || '').trim().toLowerCase();
+  if (first.startsWith('serial')) return 'serialai';
+  if (first.startsWith('film')) return 'filmas';
+  return /sezon/i.test($c.find('a.krasik__title').text()) ? 'serialai' : 'filmas';
+}
+
+// article card href -> local detail path. The kind is encoded in the type
+// (tff = film, tfs = series) so watched/wishlist know it without re-fetching.
+// Article slugs are one hyphenated segment (filmas-…-online); category pages
+// (filmai, metai/2023) are single words or have a slash — those are skipped.
+function tfLocal(href, kind) {
+  let slug = href || '';
+  try { slug = new URL(href, TOPFILMAI + '/').pathname; } catch { /* maybe already a path */ }
+  slug = slug.replace(/^\/+|\/+$/g, '');
+  if (!slug || slug.includes('/') || !slug.includes('-')) return null;
+  return `/t/${kind === 'serialai' ? 'tfs' : 'tff'}/${slug}`;
+}
+
+function tfParseCards($, scope) {
+  const items = [];
+  $(scope).find('.krasik').each((_, el) => {
+    const $c = $(el);
+    const a = $c.find('a.krasik__title').first();
+    const kind = tfCardKind($c);
+    const url = tfLocal(a.attr('href'), kind);
+    if (!url) return;
+    items.push({
+      url,
+      title: a.text().trim(),
+      poster: tfImg($c.find('.krasik__img img').first().attr('src')),
+      rating: ($c.find('.krasik__label').first().text().match(/[\d.]+/) || [''])[0],
+      year: $c.find('.krasik__year').first().text().trim(),
+      episodes: '',
+      kind,
+    });
+  });
+  const seen = new Set();
+  return items.filter(i => !seen.has(i.url) && seen.add(i.url));
+}
+
+// the file: argument of new Playerjs({...}) — a single MP4 (movie) or a JSON
+// playlist of {title,file} episodes (series, listed newest-first by the site).
+// The series array is tried first because its objects also contain a quoted
+// "file": key that the movie regex would otherwise match.
+function tfPlaylist(html) {
+  const arr = html.match(/file\s*:\s*(\[[\s\S]*?\])/);
+  if (arr) {
+    try {
+      const list = JSON.parse(arr[1]).filter(x => x && x.file);
+      if (list.length) return { kind: 'series', list };
+    } catch { /* not the playlist array */ }
+  }
+  const m = html.match(/file\s*:\s*["']([^"']+\.mp4[^"']*)["']/i);
+  return m ? { kind: 'movie', file: m[1] } : null;
+}
+
+function tfTrailer(html) {
+  const m = html.match(/youtube\.com\/embed\/([\w-]{6,})/i);
+  return m ? m[1] : null;
+}
+
+function tfParseDetail(html) {
+  const $ = cheerio.load(html);
+  const d = { original: '', votes: '', cast: [], genres: [] };
+  d.title = $('.zfx__main-header h1').first().text().trim();
+  d.poster = tfImg($('.zfx__img img').first().attr('src'));
+  d.rating = $('.zfx__list-rates-item.imdb').first().text().trim();
+  d.imdb = d.rating;
+  $('.zfx__list > li').each((_, li) => {
+    const $li = $(li);
+    const label = $li.find('span').first().text().trim().toLowerCase();
+    const vals = $li.find('a').map((__, a) => $(a).text().trim()).get().filter(Boolean);
+    if (label.startsWith('metai')) d.year = vals[0] || '';
+    else if (label.startsWith('kalba')) d.lang = vals[0] || '';
+    else if (label.startsWith('žanr') || label.startsWith('zanr'))
+      d.genres = vals.filter(g => !/^(Filmai|Serialai|Animacija)$/i.test(g));
+    else if (label.startsWith('trukm')) d.runtime = (vals[0] || '').replace(/\s+/g, ' ').trim();
+  });
+  d.description = $('.zfx__text .full-text').first().text().replace(/\s+/g, ' ').trim();
+  return d;
+}
+
+const TF = {
+  id: 'topfilmai',
+  async home() {
+    const $ = cheerio.load(await tfGet('/'));
+    const labels = { 'Filmai': 'Naujausi filmai', 'Serialai': 'Naujausi serialai' };
+    const sections = [];
+    $('.marlo').each((_, el) => {
+      const $m = $(el);
+      const items = tfParseCards($, $m.find('.marlo__content'));
+      if (!items.length) return;
+      const raw = $m.find('.marlo__title').first().text().trim();
+      sections.push({ title: labels[raw] || raw || 'Naujausi', items });
+    });
+    return sections;
+  },
+  async archive(kind, page) {
+    const base = kind === 'serialai' ? '/serialai' : '/filmai';
+    const slug = page > 1 ? `${base}/page/${page}/` : `${base}/`;
+    const $ = cheerio.load(await tfGet(slug));
+    const items = tfParseCards($, '#dle-content');
+    return { items, hasMore: items.length >= 12 };
+  },
+  async search(q) {
+    const $ = cheerio.load(await tfGet(
+      `/index.php?do=search&subaction=search&story=${enc(q)}`, 60 * 1000));
+    return tfParseCards($, '#dle-content').map(i => ({
+      url: i.url, title: i.title, original: '', poster: i.poster,
+      rating: i.rating, year: i.year, desc: '', kind: i.kind,
+    }));
+  },
+  async detail(type, id) {
+    const html = await tfGet('/' + id);
+    const d = tfParseDetail(html);
+    if (!d.title) throw new Error('Nepavyko perskaityti puslapio (gal pasikeitė šaltinio struktūra?)');
+    const backUrl = `/t/${type}/${enc(id)}`;
+    d.backUrl = backUrl;
+    const pl = tfPlaylist(html);
+    const trailerId = tfTrailer(html);
+
+    if (pl && pl.kind === 'series') {
+      d.kind = 'series';
+      // Playerjs lists episodes newest-first; show them oldest-first but keep
+      // the raw array index in the play link — play() re-parses the same array
+      // and picks the file by that index.
+      d.episodes = pl.list
+        .map((it, i) => ({ i, label: (it.title || `${i + 1} serija`).trim() }))
+        .reverse()
+        .map(e => ({
+          label: e.label,
+          servers: [{
+            name: 'Žiūrėti', tag: 'LT',
+            play: `/play?source=topfilmai&id=${enc(id)}&kind=tv&epi=${e.i}` +
+              `&t=${enc(d.title + ' – ' + e.label)}&ep=${enc(e.label)}&back=${enc(backUrl)}`,
+          }],
+        }));
+    } else {
+      d.kind = 'movie';
+      d.servers = pl ? [{
+        name: 'Žiūrėti', tag: 'LT',
+        play: `/play?source=topfilmai&id=${enc(id)}&kind=movie&t=${enc(d.title)}&back=${enc(backUrl)}`,
+      }] : [];
+      if (trailerId) d.servers.push({
+        name: 'Anonsas', tag: 'YouTube', isTrailer: true,
+        play: `/play?source=topfilmai&id=${enc(id)}&kind=trailer&yt=${enc(trailerId)}` +
+          `&nume=trailer&t=${enc(d.title + ' – anonsas')}&back=${enc(backUrl)}`,
+      });
+    }
+    // Optional: play in the site's own Playerjs (richer controls + a built-in
+    // episode list for series) instead of our bare <video>. Only when there's
+    // something to play.
+    if (pl) d.sitePlayer = `/play?source=topfilmai&id=${enc(id)}&kind=site` +
+      `&t=${enc(d.title)}&back=${enc(backUrl)}`;
+    return d;
+  },
+  async play({ id, kind, epi, yt }) {
+    if (kind === 'trailer') {
+      if (!yt) throw new Error('Nėra anonso');
+      return { embed: `https://www.youtube.com/embed/${enc(yt)}?autoplay=1` };
+    }
+    const html = await tfGet('/' + id);
+    const pl = tfPlaylist(html);
+    if (!pl) throw new Error('Nepavyko rasti vaizdo nuorodos');
+
+    // The site's own player: hand Playerjs the whole playlist (a single file for
+    // a movie, every episode for a series) so it renders exactly like the source
+    // — each file still routed through /stream so the Referer lock is satisfied.
+    if (kind === 'site') {
+      const files = pl.kind === 'series'
+        ? pl.list.map(it => ({ title: (it.title || '').trim(), url: it.file }))
+        : [{ title: '', url: pl.file }];
+      return { site: true, poster: tfParseDetail(html).poster, referer: TF_STREAM_REFERER, files };
+    }
+
+    let file;
+    if (pl.kind === 'series') {
+      const i = parseInt(epi, 10);
+      file = (Number.isInteger(i) && pl.list[i] && pl.list[i].file) || (pl.list[0] && pl.list[0].file);
+    } else {
+      file = pl.file;
+    }
+    if (!file) throw new Error('Nepavyko rasti vaizdo nuorodos');
+    return { mp4: file, referer: TF_STREAM_REFERER };
+  },
+};
+
 const SOURCES = {
   '8filmai': { id: '8filmai', name: '8filmai', emoji: '🇱🇹', desc: 'Lietuviškai įgarsinti filmai ir serialai', provider: EIGHT },
+  'topfilmai': { id: 'topfilmai', name: 'TOPfilmai', emoji: '🎬', desc: 'Lietuviški filmai ir serialai — be reklamų', provider: TF },
   'watchluna': { id: 'watchluna', name: 'WatchLuna', emoji: '🌙', desc: 'Platus angliškas filmų ir serialų katalogas', provider: WL },
 };
-const PROVIDER_BY_TYPE = { filmas: EIGHT, serialai: EIGHT, movie: WL, tv: WL };
+const PROVIDER_BY_TYPE = { filmas: EIGHT, serialai: EIGHT, movie: WL, tv: WL, tff: TF, tfs: TF };
 const SOURCE_BY_PROVIDER = id => Object.values(SOURCES).find(s => s.provider.id === id);
 
 function activeSourceId(req) {
@@ -1044,7 +1273,7 @@ function detailPage(d, sourceName) {
   const wkey = watchedKey(d.backUrl);
   const wrec = watched[wkey];
   const seenEps = (wrec && wrec.eps) || [];
-  const wlKind = /^\/t\/(serialai|tv)\//.test(wkey || '') ? 'serialai' : 'filmas';
+  const wlKind = /^\/t\/(serialai|tv|tfs)\//.test(wkey || '') ? 'serialai' : 'filmas';
   const inWishlist = !!wishlist[wkey];
   const wishlistBtn = wkey ? `
   <form class="wishlist-form" method="post" action="/wishlist/toggle">
@@ -1058,6 +1287,12 @@ function detailPage(d, sourceName) {
     </button>
   </form>` : '';
 
+  // optional "site's own player" shortcut (TopFilmai) — Playerjs with the source
+  // playlist; for a series it carries every episode, so it sits at the top.
+  const sitePlayerBtn = d.sitePlayer
+    ? `<a class="btn srv siteplayer" href="${esc(d.sitePlayer)}">▶ Originalus grotuvas <small>svetainės</small></a>`
+    : '';
+
   let sources = '';
   if (d.kind === 'movie') {
     // ad-free shortcut, shown before the trailer so it's offered first:
@@ -1068,10 +1303,12 @@ function detailPage(d, sourceName) {
     <div class="srvlist">` + adFreeBtn + (d.servers || []).map(s => `
       <a class="btn srv${s.isTrailer ? ' trailer' : ''}" href="${esc(s.play)}">
         ▶ ${esc(s.name || 'Serveris')}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}
-      </a>`).join('') + `</div>`;
+      </a>`).join('') + sitePlayerBtn + `</div>`;
     if (!(d.servers || []).length) sources += `<p class="empty">Šaltinių nerasta.</p>`;
   } else {
-    sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => {
+    sources = `<h2 class="section-title">Epizodai</h2>`
+      + (sitePlayerBtn ? `<div class="srvlist">${sitePlayerBtn}</div>` : '')
+      + (d.episodes || []).map(ep => {
       const epSeen = seenEps.includes(ep.label);
       // ad-free shortcut per episode (Streamtape MP4 or MoviesAPI HLS)
       const af = adFreeHref(ep.servers);
@@ -1256,13 +1493,15 @@ app.post('/wishlist/toggle', (req, res) => {
 });
 
 // Which source/kind a wishlist key belongs to, derived from its /t/<type>/ path:
-//   filmas|serialai -> 8filmai,  movie|tv -> watchluna.
+//   filmas|serialai -> 8filmai,  tff|tfs -> topfilmai,  movie|tv -> watchluna.
 function wishlistMeta(key) {
-  const m = /^\/t\/(filmas|serialai|movie|tv)\//.exec(key || '');
+  const m = /^\/t\/(filmas|serialai|movie|tv|tff|tfs)\//.exec(key || '');
   const type = m ? m[1] : 'filmas';
+  const sourceId = (type === 'movie' || type === 'tv') ? 'watchluna'
+    : (type === 'tff' || type === 'tfs') ? 'topfilmai' : '8filmai';
   return {
-    sourceId: (type === 'movie' || type === 'tv') ? 'watchluna' : '8filmai',
-    isSeries: (type === 'serialai' || type === 'tv'),
+    sourceId,
+    isSeries: (type === 'serialai' || type === 'tv' || type === 'tfs'),
   };
 }
 
@@ -1553,7 +1792,7 @@ app.get('/tvproxy', async (req, res) => {
   }
 });
 
-app.get('/t/:type(filmas|serialai|movie|tv)/:id', async (req, res) => {
+app.get('/t/:type(filmas|serialai|movie|tv|tff|tfs)/:id', async (req, res) => {
   const { type, id } = req.params;
   const provider = PROVIDER_BY_TYPE[type];
   try {
@@ -1575,7 +1814,7 @@ app.get('/play', async (req, res) => {
     const ep = (req.query.ep || '').toString();
     markWatched(key, {
       title: title.split(' – ')[0],
-      kind: /^\/t\/(serialai|tv)\//.test(key) ? 'serialai' : 'filmas',
+      kind: /^\/t\/(serialai|tv|tfs)\//.test(key) ? 'serialai' : 'filmas',
       ep: ep || undefined,
     });
   }
@@ -1600,6 +1839,40 @@ app.get('/play', async (req, res) => {
         return res.send(playerShell(title, back, hlsPlayerInner('', proxied, '', subTrack)));
       }
       // extraction failed — fall through to the normal embed player
+    }
+
+    // --- TOPfilmai: a direct (Referer-locked) MP4 played in our own <video>
+    // via /stream, the site's own Playerjs fed the same proxied file(s), or a
+    // YouTube trailer in a plain iframe. ---
+    if (source === 'topfilmai') {
+      const r = await provider.play(req.query);
+      if (r && r.mp4) {
+        const sq = new URLSearchParams({ u: r.mp4, r: r.referer, s: streamSig(r.mp4, r.referer) });
+        return res.send(playerShell(title, back, `
+    <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
+      }
+      if (r && r.site && r.files && r.files.length) {
+        // each file proxied through /stream (so the CDN Referer lock holds); the
+        // ".mp4" path segment is ignored by /stream but lets Playerjs pick its
+        // MP4 engine. Playerjs is the source's build, vendored into public/ and
+        // served from our origin (it has no domain lock); it renders its normal
+        // UI — playlist + next/prev for a series, single file for a movie.
+        const stream = u => `/stream/v.mp4?` +
+          new URLSearchParams({ u, r: r.referer, s: streamSig(u, r.referer) }).toString();
+        const safe = obj => JSON.stringify(obj).replace(/</g, '\\u003c');
+        const fileJs = r.files.length > 1
+          ? safe(r.files.map(f => ({ title: f.title, file: stream(f.url) })))
+          : safe(stream(r.files[0].url));
+        const inner = `<div id="player" class="playerframe"></div>
+    <script src="${asset('/playerjs.js')}"></script>
+    <script>new Playerjs({id:"player"${r.poster ? `,poster:${safe(r.poster)}` : ''},file:${fileJs}});</script>`;
+        return res.send(playerShell(title, back, inner, ''));
+      }
+      if (r && r.embed) {
+        return res.send(playerShell(title, back, `
+    <iframe class="playerframe" src="${esc(r.embed)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>`));
+      }
+      throw new Error('Nepavyko gauti grotuvo nuorodos');
     }
 
     const src = await provider.play(req.query);
@@ -1673,7 +1946,9 @@ ${stage}
 
 // Proxy the direct video bytes (DoodStream MP4 is Referer-locked, so the browser
 // can't fetch it itself). Only serves URLs we signed; forwards Range for seeking.
-app.get('/stream', async (req, res) => {
+// The optional /:fname segment (e.g. /stream/v.mp4) is ignored — it only lets a
+// player that picks its engine by file extension see an ".mp4" URL.
+app.get(['/stream', '/stream/:fname'], async (req, res) => {
   const u = (req.query.u || '').toString();
   const r = (req.query.r || '').toString();
   const s = (req.query.s || '').toString();
