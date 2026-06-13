@@ -481,7 +481,8 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
   margin-right: 6px;
   vertical-align: middle;
 }
-.btn.zap { padding: 0.6rem 0.9rem; }
+.btn.zap { padding: 0.6rem 0.9rem; display: inline-flex; align-items: center; gap: 0.35rem; }
+.zap-name { max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* IPTV player overlays */
 .tv-tap {
@@ -542,4 +543,9 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
   .ch-epg { font-size: 0.8rem; }
 
   .detail-poster { width: 150px; }
+
+  /* keep the prev/next zapper compact so the playerbar doesn't overflow */
+  .playerbar { gap: 0.5rem; }
+  .btn.zap { padding: 0.5rem 0.7rem; }
+  .zap-name { max-width: 4rem; }
 }

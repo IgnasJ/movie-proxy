@@ -1278,9 +1278,16 @@ app.get('/tv/play', (req, res) => {
   const c = channels[i];
   if (!c) return res.redirect('/tv');
 
-  const zap = (j, label) => channels[j]
-    ? `<a class="btn alt zap" href="/tv/play?c=${j}" title="${esc(channels[j].name)}">${label}</a>` : '';
-  const buttons = zap(i - 1, '‹') + zap(i + 1, '›');
+  // prev/next channel zapper — show the channel name next to the arrow
+  const zap = (j, dir) => {
+    const ch = channels[j];
+    if (!ch) return '';
+    const arrow = dir < 0 ? '‹' : '›';
+    const name = `<span class="zap-name">${esc(ch.name)}</span>`;
+    const label = dir < 0 ? `${arrow} ${name}` : `${name} ${arrow}`;
+    return `<a class="btn alt zap" href="/tv/play?c=${j}" title="${esc(ch.name)}">${label}</a>`;
+  };
+  const buttons = zap(i - 1, -1) + zap(i + 1, 1);
 
   const yt = youtubeId(c.url);
   const ifr = yt ? null : iframeSrcOf(c.url);
