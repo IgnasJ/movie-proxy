@@ -1381,15 +1381,17 @@ app.get('/tv', (req, res) => {
 // hls.js player markup (shared by live TV and the MoviesAPI ad-free path).
 // directUrl '' skips the browser-direct attempt (for Referer-locked streams that
 // only work through the proxy); proxyUrl is the /tvproxy entry point. subTrack is
-// an optional <track> (subtitles) which is force-shown once metadata loads.
+// an optional <track> (subtitles); initCaptions renders it natively (desktop +
+// iOS, where it works windowed and in fullscreen) and falls back to a DOM
+// overlay only on smart TVs, which don't paint <track> cues over hls.js/MSE
+// video — see initCaptions in iptv.js.
 function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
   return `<video id="tvvideo" class="playerframe" controls autoplay playsinline>${subTrack}</video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/hls.min.js')}"></script>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});</script>
-    ${subTrack ? `<script>(function(){var v=document.getElementById('tvvideo');function show(){try{for(var i=0;i<v.textTracks.length;i++)v.textTracks[i].mode='showing';}catch(e){}}v.addEventListener('loadedmetadata',show);show();})();</script>` : ''}`;
+    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));` : ''}</script>`;
 }
 
 app.get('/tv/play', (req, res) => {

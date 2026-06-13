@@ -168,3 +168,123 @@ function initIptv(directUrl, proxyUrl, embedUrl) {
 
   start();
 }
+
+/* Subtitle rendering for the ad-free HLS player.
+
+   Almost every browser — desktop Chrome/Firefox/Edge and iPhone/iPad Safari —
+   paints a <track>'s WebVTT cues natively, both windowed and inside the native
+   fullscreen video player. There we just switch the track on and let the
+   browser draw it (styled via ::cue in tv.css).
+
+   The exception is smart-TV browsers (Samsung Tizen, LG webOS): they parse the
+   cues but never paint them over hls.js/MSE video, so captions silently never
+   appear. Only there do we render the cues ourselves into a DOM overlay (fetch
+   the same-origin WebVTT, parse it, draw the active cue). The native fullscreen
+   button fullscreens the <video>, which would drop the sibling overlay off the
+   top layer — so on that path we also re-target fullscreen to the container
+   that holds the overlay (TV browsers are Chromium-based and allow that). We do
+   NOT use the overlay on desktop precisely because that re-target is refused by
+   Firefox, which is why the captions vanished in fullscreen there. */
+function initCaptions(video) {
+  'use strict';
+  var trackEl = video.querySelector('track');
+  if (!trackEl) return;
+
+  // Smart-TV browsers can't paint <track> over MSE; everything else can.
+  var isTV = /Tizen|Web0S|WebOS|webOS|SmartTV|SMART-TV|HbbTV|NetCast|BRAVIA|VIDAA|Viera|AQUOS|DTV/i
+    .test(navigator.userAgent || '');
+  if (!isTV) {
+    var show = function () {
+      try { for (var i = 0; i < video.textTracks.length; i++) video.textTracks[i].mode = 'showing'; }
+      catch (e) { /* not ready yet */ }
+    };
+    video.addEventListener('loadedmetadata', show);
+    show();
+    return;
+  }
+
+  // Smart-TV overlay path: drop the native track (it won't paint anyway) and
+  // draw cues into our own overlay instead.
+  var src = trackEl.getAttribute('src');
+  if (trackEl.parentNode) trackEl.parentNode.removeChild(trackEl);
+  if (!src) return;
+
+  var box = video.parentNode || document.body;
+  var overlay = document.createElement('div');
+  overlay.className = 'tv-caption';
+  overlay.setAttribute('aria-hidden', 'true');
+  box.appendChild(overlay);
+
+  // The native fullscreen button fullscreens the <video> itself, which leaves
+  // the overlay (a sibling) off the top layer — captions vanish in fullscreen.
+  // When the video goes fullscreen, re-target fullscreen to the container that
+  // holds the overlay. Browsers allow transferring fullscreen between elements
+  // from inside the fullscreenchange handler without a fresh user gesture.
+  function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+  function onFsChange() {
+    if (fsElement() !== video) return;
+    var req = box.requestFullscreen || box.webkitRequestFullscreen;
+    if (!req) return;
+    try {
+      var p = req.call(box);
+      if (p && p.catch) p.catch(function () { /* transfer refused — leave video fullscreen */ });
+    } catch (e) { /* leave the video fullscreen */ }
+  }
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+
+  // [HH:]MM:SS.mmm (or ,mmm) -> seconds
+  function toSeconds(ts) {
+    var m = ts.match(/(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/);
+    if (!m) return null;
+    return (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 +
+      parseInt(m[3], 10) + parseInt(m[4], 10) / 1000;
+  }
+
+  function parseVtt(text) {
+    var out = [];
+    var blocks = text.replace(/\r\n?/g, '\n').split(/\n\n+/);
+    for (var b = 0; b < blocks.length; b++) {
+      var lines = blocks[b].split('\n');
+      var ti = -1;
+      for (var i = 0; i < lines.length; i++) if (lines[i].indexOf('-->') !== -1) { ti = i; break; }
+      if (ti === -1) continue;
+      var bounds = lines[ti].split('-->');
+      var startT = toSeconds(bounds[0]);
+      var endT = toSeconds(bounds[1]);
+      if (startT == null || endT == null) continue;
+      // strip cue tags (<i>, <c>, inline timestamps) — overlay is plain text
+      var txt = lines.slice(ti + 1).join('\n').replace(/<[^>]+>/g, '').trim();
+      if (txt) out.push({ start: startT, end: endT, text: txt });
+    }
+    return out;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  var cues = [];
+  var lastText = null;
+  function render() {
+    var t = video.currentTime, shown = '';
+    for (var i = 0; i < cues.length; i++) {
+      if (cues[i].start <= t && t < cues[i].end) shown += (shown ? '\n' : '') + cues[i].text;
+    }
+    if (shown === lastText) return;        // avoid reflowing the DOM every tick
+    lastText = shown;
+    overlay.innerHTML = shown ? escapeHtml(shown).replace(/\n/g, '<br>') : '';
+  }
+
+  fetch(src)
+    .then(function (r) { return r.ok ? r.text() : ''; })
+    .then(function (text) {
+      cues = parseVtt(text);
+      if (!cues.length) return;
+      // timeupdate fires ~4x/s — fine granularity for subtitles; seeked covers jumps
+      video.addEventListener('timeupdate', render);
+      video.addEventListener('seeked', render);
+      render();
+    })
+    .catch(function () { /* no subs — leave the overlay empty */ });
+}
