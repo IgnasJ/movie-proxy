@@ -2,6 +2,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { Readable } = require('stream');
 const { execFile } = require('child_process');
 const express = require('express');
@@ -899,12 +900,14 @@ const WL = {
       const m = await tmdb('/movie/' + enc(id));
       if (!m || !m.id) throw new Error('Filmas nerastas');
       const title = m.title || m.original_title || '';
-      const pl = srv => `/play?source=watchluna&kind=movie&id=${enc(id)}&server=${srv}&t=${enc(title)}&back=${enc(backUrl)}`;
+      const imdbId = (m.imdb_id || '').replace(/^tt/, '');
+      const pl = srv => `/play?source=watchluna&kind=movie&id=${enc(id)}&server=${srv}` +
+        `${imdbId ? `&imdb=${enc(imdbId)}` : ''}&t=${enc(title)}&back=${enc(backUrl)}`;
       return {
         kind: 'movie', backUrl, title,
         original: (m.original_title && m.original_title !== title) ? m.original_title : '',
         // numeric imdb id (no "tt") — the LT-subtitle check queries OpenSubtitles with it
-        imdbId: (m.imdb_id || '').replace(/^tt/, ''),
+        imdbId,
         poster: wlImg(m.poster_path), year: String(m.release_date || '').slice(0, 4), imdb: '',
         runtime: m.runtime ? `${m.runtime} min` : '', lang: (m.original_language || '').toUpperCase(),
         genres: (m.genres || []).map(g => g.name),
@@ -916,6 +919,7 @@ const WL = {
     const t = await tmdb('/tv/' + enc(id) + '?append_to_response=external_ids');
     if (!t || !t.id) throw new Error('Serialas nerastas');
     const title = t.name || t.original_name || '';
+    const imdbId = ((t.external_ids && t.external_ids.imdb_id) || '').replace(/^tt/, '');
     const episodes = [];
     for (const se of (t.seasons || [])) {
       if (se.season_number == null || se.season_number === 0 || !se.episode_count) continue;
@@ -926,7 +930,7 @@ const WL = {
           servers: WL_SERVERS.map(s => ({
             name: s.name, tag: s.tag,
             play: `/play?source=watchluna&kind=tv&id=${enc(id)}&server=${s.id}&season=${se.season_number}&episode=${e}` +
-              `&t=${enc(title + ' – ' + label)}&ep=${enc(label)}&back=${enc(backUrl)}`,
+              `${imdbId ? `&imdb=${enc(imdbId)}` : ''}&t=${enc(title + ' – ' + label)}&ep=${enc(label)}&back=${enc(backUrl)}`,
           })),
         });
       }
@@ -934,7 +938,7 @@ const WL = {
     return {
       kind: 'series', backUrl, title,
       original: (t.original_name && t.original_name !== title) ? t.original_name : '',
-      imdbId: ((t.external_ids && t.external_ids.imdb_id) || '').replace(/^tt/, ''),
+      imdbId,
       poster: wlImg(t.poster_path), year: String(t.first_air_date || '').slice(0, 4), imdb: '',
       runtime: t.number_of_seasons ? `${t.number_of_seasons} sez.` : '', lang: (t.original_language || '').toUpperCase(),
       genres: (t.genres || []).map(g => g.name),
@@ -1376,14 +1380,16 @@ app.get('/tv', (req, res) => {
 
 // hls.js player markup (shared by live TV and the MoviesAPI ad-free path).
 // directUrl '' skips the browser-direct attempt (for Referer-locked streams that
-// only work through the proxy); proxyUrl is the /tvproxy entry point.
-function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '') {
-  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline></video>
+// only work through the proxy); proxyUrl is the /tvproxy entry point. subTrack is
+// an optional <track> (subtitles) which is force-shown once metadata loads.
+function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
+  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline>${subTrack}</video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/hls.min.js')}"></script>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});</script>`;
+    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});</script>
+    ${subTrack ? `<script>(function(){var v=document.getElementById('tvvideo');function show(){try{for(var i=0;i<v.textTracks.length;i++)v.textTracks[i].mode='showing';}catch(e){}}v.addEventListener('loadedmetadata',show);show();})();</script>` : ''}`;
 }
 
 app.get('/tv/play', (req, res) => {
@@ -1438,6 +1444,57 @@ app.get('/tv/epg', async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
+});
+
+/* Subtitle proxy for the ad-free HLS player: <track> needs same-origin WebVTT,
+   but OpenSubtitles serves gzipped SRT (often CP1257 for LT) with no CORS. We
+   fetch by imdb id (+ season/episode for TV) using the same API as the LT-subs
+   check, decode per its SubEncoding, and convert SRT->VTT. 404 when none exist
+   so the track silently doesn't show. Cached a day. */
+const SUB_OSL = { lt: 'lit', en: 'eng' };
+function srtToVtt(srt) {
+  const s = srt.replace(/^﻿/, '').replace(/\r\n?/g, '\n')
+    .replace(/(\d\d:\d\d:\d\d),(\d\d\d)/g, '$1.$2') // SRT comma -> VTT dot
+    // lift cues off the very bottom (where the controls bar sits): line:85% on
+    // each timing line that doesn't already carry cue settings
+    .replace(/^(\d\d:\d\d:\d\d\.\d\d\d --> \d\d:\d\d:\d\d\.\d\d\d)([^\n]*)$/gm,
+      (m, times, rest) => rest.trim() ? m : `${times} line:85%`);
+  return 'WEBVTT\n\n' + s;
+}
+app.get('/sub', async (req, res) => {
+  const imdb = (req.query.imdb || '').toString().replace(/\D/g, '');
+  const osl = SUB_OSL[(req.query.lang || '').toString()];
+  const se = (req.query.s || '').toString().replace(/\D/g, '');
+  const ep = (req.query.e || '').toString().replace(/\D/g, '');
+  if (!imdb || !osl) return res.status(400).end();
+  const ckey = `sub:${imdb}:${osl}:${se}:${ep}`;
+  const hit = cache.get(ckey);
+  const serve = (vtt) => {
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(vtt);
+  };
+  if (hit && hit.exp > Date.now()) return serve(hit.html);
+  try {
+    // OpenSubtitles requires the search tokens in alphabetical order, else it
+    // 302-redirects to the sorted URL (which then breaks the JSON fetch).
+    const parts = [`imdbid-${imdb}`, `sublanguageid-${osl}`];
+    if (se && ep) parts.push(`season-${se}`, `episode-${ep}`);
+    parts.sort();
+    const r = await fetch(`https://rest.opensubtitles.org/search/${parts.join('/')}`, { headers: { 'User-Agent': UA } });
+    const list = await r.json();
+    if (!Array.isArray(list) || !list.length) return res.status(404).end();
+    const pick = list.find(x => /srt/i.test(x.SubFormat)) || list[0];
+    if (!pick.SubDownloadLink) return res.status(404).end();
+    const raw = Buffer.from(await (await fetch(pick.SubDownloadLink, { headers: { 'User-Agent': UA } })).arrayBuffer());
+    const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? zlib.gunzipSync(raw) : raw;
+    const enc = (pick.SubEncoding || 'utf-8').toLowerCase().replace(/^cp(\d+)$/, 'windows-$1');
+    let srt;
+    try { srt = new TextDecoder(enc).decode(buf); } catch { srt = buf.toString('utf8'); }
+    const vtt = srtToVtt(srt);
+    cache.set(ckey, { html: vtt, exp: Date.now() + 24 * 3600 * 1000 });
+    serve(vtt);
+  } catch { res.status(502).end(); }
 });
 
 /* HLS-aware proxy: playlists get their URIs rewritten back through here,
@@ -1528,7 +1585,17 @@ app.get('/play', async (req, res) => {
       const hls = await resolveMoviesApiHls(req.query.kind, req.query.id, req.query.season, req.query.episode);
       if (hls) {
         const proxied = tvProxyUrl(hls.m3u8, hls.referer);
-        return res.send(playerShell(title, back, hlsPlayerInner('', proxied)));
+        // attach the picked LT/EN subtitle (served as VTT by /sub) if one exists
+        const sub = (req.query.sub === 'lt' || req.query.sub === 'en') ? req.query.sub : '';
+        const imdb = (req.query.imdb || '').toString().replace(/\D/g, '');
+        let subTrack = '';
+        if (sub && imdb) {
+          const sp = new URLSearchParams({ imdb, lang: sub });
+          if (req.query.kind === 'tv') { sp.set('s', req.query.season); sp.set('e', req.query.episode); }
+          const label = sub === 'lt' ? 'Lietuvių' : 'English';
+          subTrack = `<track kind="subtitles" srclang="${sub}" label="${esc(label)}" src="/sub?${esc(sp.toString())}" default>`;
+        }
+        return res.send(playerShell(title, back, hlsPlayerInner('', proxied, '', subTrack)));
       }
       // extraction failed — fall through to the normal embed player
     }
