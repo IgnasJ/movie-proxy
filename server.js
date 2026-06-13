@@ -20,6 +20,13 @@ if (process.env.INSECURE_TLS === '1') {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 
+// Dispatcher that ignores TLS cert mismatches, used only for /tvproxy fetches —
+// stream CDNs are often on raw IPs with certs for another name. Scoped per
+// request (not global) so TMDB and the source site keep normal verification.
+let insecureAgent = null;
+try { insecureAgent = new (require('undici').Agent)({ connect: { rejectUnauthorized: false } }); }
+catch { /* undici not exposed — fall back to default fetch */ }
+
 // Cache-busting for static assets: append the file's mtime so a changed
 // css/js gets a new URL and browsers fetch it instead of a stale cached copy
 // (the files are still cached long; the ?v= just changes when they change).
@@ -316,19 +323,22 @@ function loadIptv() {
   return iptvCache;
 }
 
-// sign proxied URLs so /tvproxy only serves what we minted (no open proxy)
-function tvSig(u) {
-  return crypto.createHash('sha256').update(`tv|${u}|${authToken}`).digest('hex').slice(0, 16);
+// sign proxied URLs so /tvproxy only serves what we minted (no open proxy).
+// r = optional Referer the proxy must send upstream (e.g. hd4u.sbs streams are
+// Referer-locked); it's part of the signature so it can't be tampered with.
+function tvSig(u, r = '') {
+  return crypto.createHash('sha256').update(`tv|${u}|${r}|${authToken}`).digest('hex').slice(0, 16);
 }
-function tvProxyUrl(u) {
-  return `/tvproxy?u=${enc(u)}&s=${tvSig(u)}`;
+function tvProxyUrl(u, r = '') {
+  return `/tvproxy?u=${enc(u)}${r ? `&r=${enc(r)}` : ''}&s=${tvSig(u, r)}`;
 }
 
 // route every URI in an HLS playlist (segments, variant playlists, keys,
-// alternate audio) back through /tvproxy, resolved against the final URL
-function rewriteM3U8(body, baseUrl) {
+// alternate audio) back through /tvproxy, resolved against the final URL.
+// The Referer is carried onto every child request so locked CDNs keep serving.
+function rewriteM3U8(body, baseUrl, referer = '') {
   const absProxy = (u) => {
-    try { return tvProxyUrl(new URL(u, baseUrl).href); } catch { return u; }
+    try { return tvProxyUrl(new URL(u, baseUrl).href, referer); } catch { return u; }
   };
   return body.split(/\r?\n/).map(line => {
     const t = line.trim();
@@ -693,6 +703,66 @@ function streamSig(u, r) {
   return crypto.createHash('sha256').update(`${u}|${r}|${authToken}`).digest('hex').slice(0, 16);
 }
 
+/* --------------------------- MoviesAPI ad-free (HLS) -------------------------
+   WatchLuna's "MoviesAPI" server (moviesapi.to) embeds the hd4u.sbs player,
+   which wraps the stream in pop-up ads and an IMA pre-roll and refuses headless
+   browsers. But its data API isn't Cloudflare-gated, so we skip the player
+   entirely: ask moviesapi for the hd4u id, hit hd4u's /api/v1/video, and decrypt
+   the AES-CBC blob to recover a plain HLS master. The key/IV are derived in the
+   player JS from window.location and resolve to these constants for hd4u.sbs.
+   The master + its segments are Referer-locked to hd4u.sbs, so playback goes
+   through /tvproxy (which sets that Referer). Fragile — falls back to the normal
+   embed if hd4u rotates the scheme. */
+const HD4U_KEY = Buffer.from('kiemtienmua911ca');
+const HD4U_IV = Buffer.from('1234567890oiuytr');
+const HD4U_REFERER = 'https://hd4u.sbs/';
+
+function hd4uDecrypt(hexBody) {
+  const hex = String(hexBody).trim().match(/[\da-f]{2}/gi);
+  if (!hex) return null;
+  const ct = Buffer.from(hex.join(''), 'hex');
+  const d = crypto.createDecipheriv('aes-128-cbc', HD4U_KEY, HD4U_IV);
+  try { return JSON.parse(Buffer.concat([d.update(ct), d.final()]).toString('utf8')); }
+  catch { return null; }
+}
+
+// (kind, tmdbId[, season, episode]) -> { m3u8, referer } or null
+async function resolveMoviesApiHls(kind, id, season, episode) {
+  const apiPath = kind === 'tv'
+    ? `tv/${enc(id)}/${enc(season)}/${enc(episode)}`
+    : `movie/${enc(id)}`;
+  // moviesapi -> hd4u player id (the hash up to the first '&': #<id>&poster=…)
+  let vid;
+  try {
+    const { body } = await curlFetch(`https://ww2.moviesapi.to/api/${apiPath}`, 'https://moviesapi.to/');
+    vid = new URL(JSON.parse(body).video_url).hash.replace(/^#/, '').split('&')[0];
+  } catch { return null; }
+  if (!vid) return null;
+
+  // Each call to /api/v1/video mints a fresh, token-bound master on a rotating
+  // CDN IP that occasionally 502s — re-mint and retry a few times. A 404 means
+  // the title isn't provisioned here, so give up and let /play use the embed.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let src;
+    try {
+      const { body: blob } = await curlFetch(
+        `https://hd4u.sbs/api/v1/video?id=${enc(vid)}&w=1920&h=1080&r=moviesapi.to`, HD4U_REFERER);
+      const j = hd4uDecrypt(blob);
+      src = j && j.source;
+    } catch { src = null; }
+    if (!src || !/\.m3u8/i.test(src)) return null;
+    try {
+      const opts = { headers: { 'User-Agent': UA, Referer: HD4U_REFERER, Accept: '*/*' }, redirect: 'follow' };
+      if (insecureAgent) opts.dispatcher = insecureAgent;
+      const probe = await fetch(src, opts);
+      try { await probe.arrayBuffer(); } catch { /* drain */ }
+      if (probe.status === 404) return null;            // not provisioned -> embed
+      if (probe.ok) return { m3u8: src, referer: HD4U_REFERER };
+    } catch { /* transient network blip — retry */ }
+  }
+  return null;
+}
+
 /* ---------------------------------- providers -------------------------------
    Each provider returns the same unified data model so the routes and rendering
    stay generic. A "source" is chosen after login and stored in the mpsrc cookie. */
@@ -955,6 +1025,17 @@ function cardGrid(items) {
   }).join('') + `</div>`;
 }
 
+// the ad-free play URL for a server list, or null if no ad-free-capable server.
+// 8filmai's Streamtape -> &bypass=1 (direct MP4); WatchLuna's MoviesAPI ->
+// &adfree=1 (decrypted HLS). Both render in our own player instead of an ad iframe.
+function adFreeHref(servers) {
+  const st = (servers || []).find(s => /STREAMT/i.test(s.tag || ''));
+  if (st) return st.play + '&bypass=1';
+  const ma = (servers || []).find(s => /MoviesAPI/i.test(s.tag || ''));
+  if (ma) return ma.play + '&adfree=1';
+  return null;
+}
+
 function detailPage(d, sourceName) {
   const wkey = watchedKey(d.backUrl);
   const wrec = watched[wkey];
@@ -975,12 +1056,10 @@ function detailPage(d, sourceName) {
 
   let sources = '';
   if (d.kind === 'movie') {
-    // ad-free shortcut: launch the Streamtape server straight into bypass mode,
-    // shown before the trailer button so it's the first thing offered.
-    const stapeSrv = (d.servers || []).find(s => /STREAMT/i.test(s.tag || ''));
-    const adFreeBtn = stapeSrv
-      ? `<a class="btn srv adfree" href="${esc(stapeSrv.play + '&bypass=1')}">▶ Be reklamų</a>`
-      : '';
+    // ad-free shortcut, shown before the trailer so it's offered first:
+    // 8filmai -> Streamtape direct MP4; WatchLuna -> MoviesAPI HLS extraction.
+    const af = adFreeHref(d.servers);
+    const adFreeBtn = af ? `<a class="btn srv adfree" href="${esc(af)}">▶ Be reklamų</a>` : '';
     sources = `<h2 class="section-title">Šaltiniai</h2>
     <div class="srvlist">` + adFreeBtn + (d.servers || []).map(s => `
       <a class="btn srv${s.isTrailer ? ' trailer' : ''}" href="${esc(s.play)}">
@@ -990,10 +1069,10 @@ function detailPage(d, sourceName) {
   } else {
     sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => {
       const epSeen = seenEps.includes(ep.label);
-      // ad-free shortcut per episode: Streamtape server straight into bypass mode
-      const stapeSrv = ep.servers.find(s => /STREAMT/i.test(s.tag || ''));
-      const adFreeBtn = stapeSrv
-        ? `<a class="btn srv adfree" data-ep="${esc(ep.label)}" href="${esc(stapeSrv.play + '&bypass=1')}">▶ Be reklamų</a>`
+      // ad-free shortcut per episode (Streamtape MP4 or MoviesAPI HLS)
+      const af = adFreeHref(ep.servers);
+      const adFreeBtn = af
+        ? `<a class="btn srv adfree" data-ep="${esc(ep.label)}" href="${esc(af)}">▶ Be reklamų</a>`
         : '';
       return `
     <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
@@ -1295,6 +1374,18 @@ app.get('/tv', (req, res) => {
   res.send(layout('TV kanalai', body, opts));
 });
 
+// hls.js player markup (shared by live TV and the MoviesAPI ad-free path).
+// directUrl '' skips the browser-direct attempt (for Referer-locked streams that
+// only work through the proxy); proxyUrl is the /tvproxy entry point.
+function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '') {
+  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline></video>
+    <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
+    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
+    <script src="${asset('/hls.min.js')}"></script>
+    <script src="${asset('/iptv.js')}"></script>
+    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});</script>`;
+}
+
 app.get('/tv/play', (req, res) => {
   const { channels } = loadIptv();
   const i = parseInt(req.query.c, 10);
@@ -1318,12 +1409,7 @@ app.get('/tv/play', (req, res) => {
     ? `<iframe class="playerframe" src="https://www.youtube-nocookie.com/embed/${esc(yt)}?autoplay=1&playsinline=1" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe>`
     : ifr
     ? `<iframe class="playerframe" src="${esc(ifr)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`
-    : `<video id="tvvideo" class="playerframe" controls autoplay playsinline></video>
-    <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
-    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti kanalo. <a href="">Bandyti dar kartą</a></div>
-    <script src="${asset('/hls.min.js')}"></script>
-    <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(c.url)}, ${JSON.stringify(tvProxyUrl(c.url))}, ${JSON.stringify(c.embed || '')});</script>`;
+    : hlsPlayerInner(c.url, tvProxyUrl(c.url), c.embed || '');
 
   res.send(playerShell(c.name, '/tv', inner, buttons, '', c.epg || ''));
 });
@@ -1358,14 +1444,19 @@ app.get('/tv/epg', async (req, res) => {
    everything else (segments, keys, direct mp4/radio) is piped through. */
 app.get('/tvproxy', async (req, res) => {
   const u = (req.query.u || '').toString();
+  const r = (req.query.r || '').toString();
   const s = (req.query.s || '').toString();
-  if (!u || s !== tvSig(u)) return res.status(403).end();
+  if (!u || s !== tvSig(u, r)) return res.status(403).end();
   try {
-    // No Referer: these CDNs all serve fine without one, and a self-origin
-    // Referer actively breaks some (e.g. dcdn.lt answers 204 to it).
+    // By default no Referer: most CDNs serve fine without one, and a self-origin
+    // Referer actively breaks some (e.g. dcdn.lt answers 204 to it). Some streams
+    // are Referer-locked though (hd4u.sbs) — r carries the one to send.
     const headers = { 'User-Agent': UA, 'Accept': '*/*' };
+    if (r) headers.Referer = r;
     if (req.headers.range) headers.Range = req.headers.range;
-    const up = await fetch(u, { headers, redirect: 'follow' });
+    const opts = { headers, redirect: 'follow' };
+    if (insecureAgent) opts.dispatcher = insecureAgent;
+    const up = await fetch(u, opts);
     if (!up.ok && up.status !== 206) return res.status(up.status === 404 ? 404 : 502).end();
     const finalUrl = up.url || u;
     const ct = (up.headers.get('content-type') || '').toLowerCase();
@@ -1376,14 +1467,14 @@ app.get('/tvproxy', async (req, res) => {
       if (body.trimStart().startsWith('#EXTM3U')) {
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Cache-Control', 'no-store');
-        return res.send(rewriteM3U8(body, finalUrl));
+        return res.send(rewriteM3U8(body, finalUrl, r));
       }
       // JSON wrapper (LRT get_live_url.php, tv3 playlist API, …) — pull the real
       // HLS url out. Handles \/ escaping and protocol-relative //host urls, and
       // prefers a plain HLS source over DRM/Verimatrix (VMX) variants.
       const urls = body.replace(/\\\//g, '/').match(/(?:https?:)?\/\/[^"'\s\\]+?\.m3u8[^"'\s\\]*/gi) || [];
       const pick = urls.find(u => /GO3_LIVE_HLS/.test(u)) || urls.find(u => !/VMX|nHLS/i.test(u)) || urls[0];
-      if (pick) return res.redirect(tvProxyUrl(pick.startsWith('//') ? 'https:' + pick : pick));
+      if (pick) return res.redirect(tvProxyUrl(pick.startsWith('//') ? 'https:' + pick : pick, r));
       // not a playlist after all (e.g. small text/binary file) — pass through
       res.status(up.status);
       if (ct) res.setHeader('Content-Type', ct);
@@ -1431,6 +1522,17 @@ app.get('/play', async (req, res) => {
   }
 
   try {
+    // --- WatchLuna ad-free: pull a clean HLS master from MoviesAPI/hd4u and
+    // play it in our own hls.js player through /tvproxy (Referer-locked). ---
+    if (source === 'watchluna' && req.query.adfree === '1') {
+      const hls = await resolveMoviesApiHls(req.query.kind, req.query.id, req.query.season, req.query.episode);
+      if (hls) {
+        const proxied = tvProxyUrl(hls.m3u8, hls.referer);
+        return res.send(playerShell(title, back, hlsPlayerInner('', proxied)));
+      }
+      // extraction failed — fall through to the normal embed player
+    }
+
     const src = await provider.play(req.query);
     if (!src) throw new Error('Nepavyko gauti grotuvo nuorodos');
 
