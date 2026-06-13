@@ -279,6 +279,8 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
 .btn.srv small { opacity: 0.75; font-weight: 400; }
 .btn.srv.trailer { background: #8e2430; }
 .btn.srv.adfree { background: #e5a00d; color: #14151a; }
+.btn.srv.adfree2 { background: #b9790a; color: #14151a; }   /* ad-free, but in the Playerjs UI */
+.btn.srv.siteplayer { background: #3f51b5; color: #fff; }   /* the source site's own player */
 .episode {
   display: flex;
   align-items: center;
@@ -542,6 +544,11 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
   text-shadow: 0 1px 2px #000;
 }
 .tv-caption:empty { display: none; }
+
+/* Playerjs draws its subtitle box with inline styles from the sub_* config we
+   pass (see PJS_SUB_STYLE in server.js) so it matches .tv-caption — except for
+   the rounded corners, which it has no option for. Its box is #pjs_<id>_subtitle. */
+.playerpage [id$="_subtitle"] { border-radius: 6px; }
 
 /* When subtitles are on we transfer fullscreen from the <video> to its
    container (so the overlay rides along — see initCaptions). Make the container

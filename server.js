@@ -1299,8 +1299,12 @@ function detailPage(d, sourceName) {
     // 8filmai -> Streamtape direct MP4; WatchLuna -> MoviesAPI HLS extraction.
     const af = adFreeHref(d.servers);
     const adFreeBtn = af ? `<a class="btn srv adfree" href="${esc(af)}">▶ Be reklamų</a>` : '';
+    // v2: the same ad-free stream (8filmai MP4 / WatchLuna HLS) but in the
+    // Playerjs UI
+    const adFreeBtn2 = af
+      ? `<a class="btn srv adfree2" href="${esc(af + '&player=pjs')}">▶ Be reklamų v2</a>` : '';
     sources = `<h2 class="section-title">Šaltiniai</h2>
-    <div class="srvlist">` + adFreeBtn + (d.servers || []).map(s => `
+    <div class="srvlist">` + adFreeBtn + adFreeBtn2 + (d.servers || []).map(s => `
       <a class="btn srv${s.isTrailer ? ' trailer' : ''}" href="${esc(s.play)}">
         ▶ ${esc(s.name || 'Serveris')}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}
       </a>`).join('') + sitePlayerBtn + `</div>`;
@@ -1315,10 +1319,13 @@ function detailPage(d, sourceName) {
       const adFreeBtn = af
         ? `<a class="btn srv adfree" data-ep="${esc(ep.label)}" href="${esc(af)}">▶ Be reklamų</a>`
         : '';
+      const adFreeBtn2 = af
+        ? `<a class="btn srv adfree2" data-ep="${esc(ep.label)}" href="${esc(af + '&player=pjs')}">▶ Be reklamų v2</a>`
+        : '';
       return `
     <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
       <div class="ep-label">${esc(ep.label)}${epSeen ? ` <span class="eptick">✓</span>` : ''}</div>
-      <div class="ep-servers">` + adFreeBtn + ep.servers.map(s => `
+      <div class="ep-servers">` + adFreeBtn + adFreeBtn2 + ep.servers.map(s => `
         <a class="btn srv" data-ep="${esc(ep.label)}" href="${esc(s.play)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
       </div>
     </div>`;
@@ -1633,6 +1640,48 @@ function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
     <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));` : ''}</script>`;
 }
 
+// Build a Playerjs `file` value from raw URLs, each routed through /stream so
+// Referer-locked CDNs keep serving: a single string for one file, or a
+// {title,file} playlist array for several. The "/v.mp4" segment is ignored by
+// /stream — it just lets Playerjs pick its MP4 engine by extension.
+function streamFiles(files, referer) {
+  const stream = u => `/stream/v.mp4?` +
+    new URLSearchParams({ u, r: referer, s: streamSig(u, referer) }).toString();
+  return files.length > 1
+    ? files.map(f => ({ title: f.title || '', file: stream(f.url) }))
+    : stream(files[0].url);
+}
+
+// House subtitle styling for Playerjs, to mirror the .tv-caption overlay our
+// hls.js player draws: bigger, semi-bold white text on a translucent black box
+// (Playerjs's defaults are small 14px/weight-400 with a near-opaque bg). Colors
+// are hex without '#'; sub_bga is a 0–1 alpha; sizes are px.
+const PJS_SUB_STYLE = {
+  sub_size: 18, sub_size_fullscreen: 28, sub_weight: 600, sub_lineheight: 1.35,
+  sub_color: 'ffffff', sub_bg: 1, sub_bgcolor: '000000', sub_bga: 0.6,
+  sub_bgpadding: 4, sub_shadow: 1,
+};
+
+// Render the vendored Playerjs (public/playerjs.js, served from our origin, no
+// domain lock). `file` is the final Playerjs file value — a URL string (MP4 with
+// a .mp4-looking path, or HLS with .m3u8 visible in the URL) or a {title,file}
+// playlist array. `subtitle`, when set, is Playerjs's "[Label]url" form (the url
+// needs a .vtt/.srt in it) and is auto-enabled, styled per PJS_SUB_STYLE. Used
+// by the TopFilmai site player and the 8filmai / WatchLuna "Be reklamų v2".
+function playerjsInner(file, { subtitle = '', poster = '' } = {}) {
+  const safe = v => JSON.stringify(v).replace(/</g, '\\u003c');
+  const opts = ['id:"player"'];
+  if (poster) opts.push(`poster:${safe(poster)}`);
+  opts.push(`file:${safe(file)}`);
+  if (subtitle) {
+    opts.push(`subtitle:${safe(subtitle)}`);
+    for (const [k, v] of Object.entries(PJS_SUB_STYLE)) opts.push(`${k}:${safe(v)}`);
+  }
+  return `<div id="player" class="playerframe"></div>
+    <script src="${asset('/playerjs.js')}"></script>
+    <script>new Playerjs({${opts.join(',')}});</script>`;
+}
+
 app.get('/tv/play', (req, res) => {
   const { channels } = loadIptv();
   const i = parseInt(req.query.c, 10);
@@ -1702,7 +1751,9 @@ function srtToVtt(srt) {
       (m, times, rest) => rest.trim() ? m : `${times} line:85%`);
   return 'WEBVTT\n\n' + s;
 }
-app.get('/sub', async (req, res) => {
+// The optional /:fname segment (e.g. /sub/s.vtt) is ignored — it only lets
+// Playerjs recognise the response as a subtitle by its .vtt extension.
+app.get(['/sub', '/sub/:fname'], async (req, res) => {
   const imdb = (req.query.imdb || '').toString().replace(/\D/g, '');
   const osl = SUB_OSL[(req.query.lang || '').toString()];
   const se = (req.query.s || '').toString().replace(/\D/g, '');
@@ -1739,8 +1790,10 @@ app.get('/sub', async (req, res) => {
 });
 
 /* HLS-aware proxy: playlists get their URIs rewritten back through here,
-   everything else (segments, keys, direct mp4/radio) is piped through. */
-app.get('/tvproxy', async (req, res) => {
+   everything else (segments, keys, direct mp4/radio) is piped through.
+   The optional /:fname segment (e.g. /tvproxy/master.m3u8) is ignored — it only
+   lets Playerjs recognise an HLS master by its .m3u8 extension. */
+app.get(['/tvproxy', '/tvproxy/:fname'], async (req, res) => {
   const u = (req.query.u || '').toString();
   const r = (req.query.r || '').toString();
   const s = (req.query.s || '').toString();
@@ -1826,16 +1879,29 @@ app.get('/play', async (req, res) => {
       const hls = await resolveMoviesApiHls(req.query.kind, req.query.id, req.query.season, req.query.episode);
       if (hls) {
         const proxied = tvProxyUrl(hls.m3u8, hls.referer);
-        // attach the picked LT/EN subtitle (served as VTT by /sub) if one exists
+        // the picked LT/EN subtitle (served as VTT by /sub) if one exists
         const sub = (req.query.sub === 'lt' || req.query.sub === 'en') ? req.query.sub : '';
         const imdb = (req.query.imdb || '').toString().replace(/\D/g, '');
-        let subTrack = '';
+        let subSp = null;
+        const label = sub === 'lt' ? 'Lietuvių' : 'English';
         if (sub && imdb) {
-          const sp = new URLSearchParams({ imdb, lang: sub });
-          if (req.query.kind === 'tv') { sp.set('s', req.query.season); sp.set('e', req.query.episode); }
-          const label = sub === 'lt' ? 'Lietuvių' : 'English';
-          subTrack = `<track kind="subtitles" srclang="${sub}" label="${esc(label)}" src="/sub?${esc(sp.toString())}" default>`;
+          subSp = new URLSearchParams({ imdb, lang: sub });
+          if (req.query.kind === 'tv') { subSp.set('s', req.query.season); subSp.set('e', req.query.episode); }
         }
+        // "v2": the same HLS + subtitle, but in the vendored Playerjs UI. Playerjs
+        // picks its HLS engine from the ".m3u8" in the proxied URL, and renders
+        // the subtitle itself ([Label]/sub/s.vtt) — so it works even on smart TVs
+        // that won't paint <track> cues over hls.js/MSE.
+        if (req.query.player === 'pjs') {
+          const file = proxied.replace('/tvproxy?', '/tvproxy/master.m3u8?');
+          const subtitle = subSp ? `[${label}]/sub/s.vtt?${subSp.toString()}` : '';
+          return res.send(playerShell(title, back, playerjsInner(file, { subtitle })));
+        }
+        // default: our own hls.js player, subtitle as a native <track> rendered
+        // by initCaptions (with the smart-TV overlay fallback)
+        const subTrack = subSp
+          ? `<track kind="subtitles" srclang="${sub}" label="${esc(label)}" src="/sub?${esc(subSp.toString())}" default>`
+          : '';
         return res.send(playerShell(title, back, hlsPlayerInner('', proxied, '', subTrack)));
       }
       // extraction failed — fall through to the normal embed player
@@ -1852,21 +1918,9 @@ app.get('/play', async (req, res) => {
     <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
       }
       if (r && r.site && r.files && r.files.length) {
-        // each file proxied through /stream (so the CDN Referer lock holds); the
-        // ".mp4" path segment is ignored by /stream but lets Playerjs pick its
-        // MP4 engine. Playerjs is the source's build, vendored into public/ and
-        // served from our origin (it has no domain lock); it renders its normal
-        // UI — playlist + next/prev for a series, single file for a movie.
-        const stream = u => `/stream/v.mp4?` +
-          new URLSearchParams({ u, r: r.referer, s: streamSig(u, r.referer) }).toString();
-        const safe = obj => JSON.stringify(obj).replace(/</g, '\\u003c');
-        const fileJs = r.files.length > 1
-          ? safe(r.files.map(f => ({ title: f.title, file: stream(f.url) })))
-          : safe(stream(r.files[0].url));
-        const inner = `<div id="player" class="playerframe"></div>
-    <script src="${asset('/playerjs.js')}"></script>
-    <script>new Playerjs({id:"player"${r.poster ? `,poster:${safe(r.poster)}` : ''},file:${fileJs}});</script>`;
-        return res.send(playerShell(title, back, inner, ''));
+        // the source's own Playerjs UI — playlist + next/prev for a series,
+        // single file for a movie (see playerjsInner)
+        return res.send(playerShell(title, back, playerjsInner(streamFiles(r.files, r.referer), { poster: r.poster }), ''));
       }
       if (r && r.embed) {
         return res.send(playerShell(title, back, `
@@ -1885,6 +1939,11 @@ app.get('/play', async (req, res) => {
     if (stape && wantBypass) {
       const direct = await resolveStreamtapeMp4(src);
       if (direct) {
+        // "v2" plays the same MP4 in the vendored Playerjs UI instead of a bare
+        // <video> (handy for testing that player against a non-TopFilmai source)
+        if (req.query.player === 'pjs') {
+          return res.send(playerShell(title, back, playerjsInner(streamFiles([{ url: direct.url }], direct.referer)), ''));
+        }
         const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
         return res.send(playerShell(title, back, `
     <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
