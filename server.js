@@ -990,10 +990,15 @@ function detailPage(d, sourceName) {
   } else {
     sources = `<h2 class="section-title">Epizodai</h2>` + (d.episodes || []).map(ep => {
       const epSeen = seenEps.includes(ep.label);
+      // ad-free shortcut per episode: Streamtape server straight into bypass mode
+      const stapeSrv = ep.servers.find(s => /STREAMT/i.test(s.tag || ''));
+      const adFreeBtn = stapeSrv
+        ? `<a class="btn srv adfree" data-ep="${esc(ep.label)}" href="${esc(stapeSrv.play + '&bypass=1')}">▶ Be reklamų</a>`
+        : '';
       return `
     <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
       <div class="ep-label">${esc(ep.label)}${epSeen ? ` <span class="eptick">✓</span>` : ''}</div>
-      <div class="ep-servers">` + ep.servers.map(s => `
+      <div class="ep-servers">` + adFreeBtn + ep.servers.map(s => `
         <a class="btn srv" data-ep="${esc(ep.label)}" href="${esc(s.play)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
       </div>
     </div>`;
