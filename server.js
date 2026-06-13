@@ -56,6 +56,10 @@ function loginPage({ error = false, next = '/' } = {}) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="${asset('/favicon.svg')}" type="image/svg+xml">
+<link rel="alternate icon" href="${asset('/favicon.png')}" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="${asset('/apple-touch-icon.png')}">
+<meta name="theme-color" content="#14151a">
 <title>Prisijungimas</title>
 <link rel="stylesheet" href="${asset('/tv.css')}">
 </head>
@@ -187,6 +191,45 @@ function markWatched(key, { title, kind, ep } = {}) {
   }
   watched[key] = rec;
   persistWatched();
+}
+
+/* ------------------------- wishlist store (shared, on disk) ------------------
+   Same shape and persistence strategy as the watched store, but toggled by the
+   user from a film/serial detail page (not automatic). Keyed by the local detail
+   path so the wishlist page can link straight back. Stores enough to render a
+   card (title/poster/kind/rating) without re-fetching the source. */
+
+const WISHLIST_FILE = process.env.WISHLIST_FILE || path.join(__dirname, 'data', 'wishlist.json');
+let wishlist = {};
+try {
+  wishlist = JSON.parse(fs.readFileSync(WISHLIST_FILE, 'utf8')) || {};
+} catch { /* first run — no file yet */ }
+
+let wlSaveTimer = null;
+function persistWishlist() {
+  if (wlSaveTimer) return;
+  wlSaveTimer = setTimeout(() => {
+    wlSaveTimer = null;
+    try {
+      fs.mkdirSync(path.dirname(WISHLIST_FILE), { recursive: true });
+      const tmp = WISHLIST_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(wishlist));
+      fs.renameSync(tmp, WISHLIST_FILE);
+    } catch (e) { console.error('wishlist persist failed:', e.message); }
+  }, 400);
+}
+
+// Add when missing, remove when present. Returns the new state (true = in list).
+function toggleWishlist(key, { title, poster, kind, rating } = {}) {
+  if (!key) return false;
+  if (wishlist[key]) {
+    delete wishlist[key];
+    persistWishlist();
+    return false;
+  }
+  wishlist[key] = { title, poster, kind, rating, t: Date.now() };
+  persistWishlist();
+  return true;
 }
 
 /* ------------------------------- IPTV (live TV) ------------------------------
@@ -847,6 +890,7 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
     ['/', 'Pradžia', 'home'],
     ['/filmai', 'Filmai', 'filmai'],
     ['/serialai', 'Serialai', 'serialai'],
+    ['/sarasas', 'Sąrašas', 'wishlist'],
     ['/tv', 'TV', 'tv'],
   ].map(([href, label, key]) =>
     `<a class="navlink${active === key ? ' active' : ''}" href="${href}">${label}</a>`).join('');
@@ -856,6 +900,10 @@ function layout(title, body, { query = '', active = '', source = '', hideNav = f
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="${asset('/favicon.svg')}" type="image/svg+xml">
+<link rel="alternate icon" href="${asset('/favicon.png')}" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="${asset('/apple-touch-icon.png')}">
+<meta name="theme-color" content="#14151a">
 <title>${esc(title)}</title>
 <link rel="stylesheet" href="${asset('/tv.css')}">
 </head>
@@ -896,8 +944,22 @@ function cardGrid(items) {
 }
 
 function detailPage(d, sourceName) {
-  const wrec = watched[watchedKey(d.backUrl)];
+  const wkey = watchedKey(d.backUrl);
+  const wrec = watched[wkey];
   const seenEps = (wrec && wrec.eps) || [];
+  const wlKind = /^\/t\/(serialai|tv)\//.test(wkey || '') ? 'serialai' : 'filmas';
+  const inWishlist = !!wishlist[wkey];
+  const wishlistBtn = wkey ? `
+  <form class="wishlist-form" method="post" action="/wishlist/toggle">
+    <input type="hidden" name="key" value="${esc(wkey)}">
+    <input type="hidden" name="title" value="${esc(d.title)}">
+    <input type="hidden" name="poster" value="${esc(d.poster)}">
+    <input type="hidden" name="kind" value="${wlKind}">
+    <input type="hidden" name="rating" value="${esc(d.rating || '')}">
+    <button type="submit" class="btn wishlist-btn${inWishlist ? ' active' : ''}" aria-pressed="${inWishlist}">
+      <span class="wl-on">✓ Sąraše</span><span class="wl-off">+ Į sąrašą</span>
+    </button>
+  </form>` : '';
 
   let sources = '';
   if (d.kind === 'movie') {
@@ -938,6 +1000,7 @@ function detailPage(d, sourceName) {
       </div>
       ${d.genres.length ? `<div class="meta-row">${d.genres.map(g => `<span class="chip genre">${esc(g)}</span>`).join('')}</div>` : ''}
       ${wrec ? `<div class="meta-row"><span class="chip watched">✓ Žiūrėta</span></div>` : ''}
+      ${wishlistBtn ? `<div class="meta-row">${wishlistBtn}</div>` : ''}
       ${d.description ? `<p class="desc">${esc(d.description)}</p>` : ''}
     </div>
   </div>
@@ -1067,6 +1130,68 @@ function archiveRoute(kind, label, activeKey) {
 }
 app.get('/filmai', archiveRoute('filmai', 'Filmai', 'filmai'));
 app.get('/serialai', archiveRoute('serialai', 'Serialai', 'serialai'));
+
+/* -------------------------------- wishlist -------------------------------- */
+
+app.post('/wishlist/toggle', (req, res) => {
+  const key = watchedKey((req.body.key || '').toString());
+  const inList = toggleWishlist(key, {
+    title: (req.body.title || '').toString(),
+    poster: (req.body.poster || '').toString(),
+    kind: (req.body.kind || 'filmas').toString(),
+    rating: (req.body.rating || '').toString(),
+  });
+  // fetch() callers (progressive enhancement) get JSON; everyone else is
+  // redirected back to where they came from so the button re-renders.
+  if ((req.headers.accept || '').includes('application/json')) {
+    return res.json({ inList });
+  }
+  res.redirect(key || '/');
+});
+
+// Which source/kind a wishlist key belongs to, derived from its /t/<type>/ path:
+//   filmas|serialai -> 8filmai,  movie|tv -> watchluna.
+function wishlistMeta(key) {
+  const m = /^\/t\/(filmas|serialai|movie|tv)\//.exec(key || '');
+  const type = m ? m[1] : 'filmas';
+  return {
+    sourceId: (type === 'movie' || type === 'tv') ? 'watchluna' : '8filmai',
+    isSeries: (type === 'serialai' || type === 'tv'),
+  };
+}
+
+app.get('/sarasas', (req, res) => {
+  const entries = Object.entries(wishlist)
+    .sort((a, b) => (b[1].t || 0) - (a[1].t || 0))
+    .map(([url, r]) => ({ url, rec: r, meta: wishlistMeta(url) }));
+
+  // Source order follows the SOURCES definition; movies before series.
+  let sections = '';
+  for (const sid of Object.keys(SOURCES)) {
+    const inSource = entries.filter(e => e.meta.sourceId === sid);
+    if (!inSource.length) continue;
+    const src = SOURCES[sid];
+    let groups = '';
+    for (const [label, isSeries] of [['Filmai', false], ['Serialai', true]]) {
+      const items = inSource
+        .filter(e => e.meta.isSeries === isSeries)
+        .map(e => ({ url: e.url, poster: e.rec.poster, title: e.rec.title, kind: e.rec.kind, rating: e.rec.rating }));
+      if (!items.length) continue;
+      groups += `<h3 class="wl-subtitle">${label} <span class="wl-count">${items.length}</span></h3>${cardGrid(items)}`;
+    }
+    sections += `<section class="wl-source">
+      <h2 class="section-title">${esc(src.emoji)} ${esc(src.name)} <span class="wl-count">${inSource.length}</span></h2>
+      ${groups}
+    </section>`;
+  }
+
+  const body = entries.length
+    ? `<h1 class="wl-heading">Mano sąrašas <span class="wl-count">${entries.length}</span></h1>${sections}`
+    : `<h2 class="section-title">Mano sąrašas</h2>
+       <p class="empty">Sąrašas tuščias. Atidaryk filmą ar serialą ir paspausk „+ Į sąrašą".</p>`;
+  const id = activeSourceId(req);
+  res.send(layout('Mano sąrašas', body, { active: 'wishlist', source: id ? SOURCES[id].name : '' }));
+});
 
 app.get('/search', async (req, res) => {
   const id = activeSourceId(req);
@@ -1325,6 +1450,10 @@ function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="${asset('/favicon.svg')}" type="image/svg+xml">
+<link rel="alternate icon" href="${asset('/favicon.png')}" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="${asset('/apple-touch-icon.png')}">
+<meta name="theme-color" content="#14151a">
 <title>${esc(title)}</title>
 <link rel="stylesheet" href="${asset('/tv.css')}">
 </head>

@@ -69,4 +69,22 @@
     var first = document.querySelector('main a, .playerbar a, a[href]');
     if (first) first.focus();
   }
+
+  // Wishlist toggle: intercept the form submit and flip state in place via
+  // fetch, so the page doesn't reload. Falls back to a normal POST + redirect
+  // if fetch is unavailable or the request fails.
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form.classList || !form.classList.contains('wishlist-form') || !window.fetch) return;
+    e.preventDefault();
+    var btn = form.querySelector('.wishlist-btn');
+    fetch(form.action, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(new FormData(form)).toString()
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      if (btn) btn.classList.toggle('active', !!data.inList);
+      if (btn) btn.setAttribute('aria-pressed', data.inList ? 'true' : 'false');
+    }).catch(function () { form.submit(); });
+  });
 })();
