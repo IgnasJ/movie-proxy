@@ -1265,7 +1265,9 @@ const TF = {
     // — each file still routed through /stream so the Referer lock is satisfied.
     if (kind === 'site') {
       const files = pl.kind === 'series'
-        ? pl.list.map(it => ({ title: (it.title || '').trim(), url: it.file }))
+        // the source lists episodes newest-first; reverse so the player's
+        // playlist reads oldest-first (1, 2, 3…), matching our episode buttons
+        ? [...pl.list].reverse().map(it => ({ title: (it.title || '').trim(), url: it.file }))
         : [{ title: '', url: pl.file }];
       return { site: true, poster: tfParseDetail(html).poster, referer: TF_STREAM_REFERER, files };
     }
@@ -1820,7 +1822,7 @@ const PJS_SUB_STYLE = {
 // playlist array. `subtitle`, when set, is Playerjs's "[Label]url" form (the url
 // needs a .vtt/.srt in it) and is auto-enabled, styled per PJS_SUB_STYLE. Used
 // by the TopFilmai site player and the 8filmai / WatchLuna "Be reklamų v2".
-function playerjsInner(file, { subtitle = '', poster = '' } = {}) {
+function playerjsInner(file, { subtitle = '', poster = '', playlistToFirst = false } = {}) {
   const safe = v => JSON.stringify(v).replace(/</g, '\\u003c');
   const opts = ['id:"player"'];
   if (poster) opts.push(`poster:${safe(poster)}`);
@@ -1854,9 +1856,21 @@ function playerjsInner(file, { subtitle = '', poster = '' } = {}) {
       `try{var pr=rq.call(b);if(pr&&pr.catch)pr.catch(function(){})}catch(e){}}` +
       `document.addEventListener('fullscreenchange',onFs);document.addEventListener('webkitfullscreenchange',onFs)})();`
     : '';
+  // Playerjs defaults a fresh playlist to the LAST (newest) episode. For the
+  // TopFilmai site player, start at the first episode instead — but skip it when
+  // a saved position for this URL exists, since then Playerjs resumes the
+  // last-watched episode (which is what we want). api('prev') is the only working
+  // jump, so step back until the source stops changing (= reached the first).
+  const playlistInit = playlistToFirst
+    ? `(function(){try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);` +
+      `if(k&&k.indexOf('pljsplayfrom_')===0&&k.indexOf(location.search)!==-1)return}}catch(e){}` +
+      `var n=0,iv=setInterval(function(){if(!document.querySelector('#player video')){if(++n>60)clearInterval(iv);return}clearInterval(iv);` +
+      `var last='',same=0,st=setInterval(function(){var v=document.querySelector('#player video');var c=v?(v.currentSrc||v.src||''):'';` +
+      `if(c===last){if(++same>=2)clearInterval(st);return}last=c;same=0;try{pjsp.api('prev')}catch(e){}},350)},200)})();`
+    : '';
   return `<div id="player" class="playerframe"></div>
     <script src="${asset('/playerjs.js')}"></script>
-    <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}</script>`;
+    <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}${playlistInit}</script>`;
 }
 
 app.get('/tv/play', (req, res) => {
@@ -2103,8 +2117,11 @@ app.get('/play', async (req, res) => {
       }
       if (r && r.site && r.files && r.files.length) {
         // the source's own Playerjs UI — playlist + next/prev for a series,
-        // single file for a movie (see playerjsInner)
-        return res.send(playerShell(title, back, playerjsInner(streamFiles(r.files, r.referer), { poster: r.poster }), ''));
+        // single file for a movie (see playerjsInner). For a series, start at the
+        // first episode (Playerjs would otherwise open the newest one).
+        return res.send(playerShell(title, back, playerjsInner(
+          streamFiles(r.files, r.referer),
+          { poster: r.poster, playlistToFirst: r.files.length > 1 }), ''));
       }
       if (r && r.embed) {
         return res.send(playerShell(title, back, `
