@@ -350,6 +350,19 @@ function rewriteM3U8(body, baseUrl, referer = '') {
   }).join('\n');
 }
 
+// Pipe an upstream fetch() body to the client, surviving aborts. Without the
+// 'error' handler, a CDN dropping the socket mid-stream (or the viewer closing
+// the player) emits an unhandled 'error' on the Readable and crashes the whole
+// process. We also destroy the upstream when the client goes away so we stop
+// pulling bytes we'll never send.
+function streamUpstream(up, res) {
+  if (!up.body) return res.end();
+  const body = Readable.fromWeb(up.body);
+  body.on('error', () => { try { res.destroy(); } catch { /* already gone */ } });
+  res.on('close', () => { try { body.destroy(); } catch { /* already gone */ } });
+  body.pipe(res);
+}
+
 function youtubeId(u) {
   const m = String(u).match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|live\/|shorts\/)|youtu\.be\/)([\w-]{6,})/);
   return m ? m[1] : null;
@@ -659,7 +672,6 @@ function isStreamtapeHost(host) {
 // (post-redirect) URL after a marker so we can recover the real origin after any
 // mirror redirect.
 const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
-const NULLDEV = process.platform === 'win32' ? 'NUL' : '/dev/null';
 function curlFetch(url, referer) {
   return new Promise((resolve, reject) => {
     execFile(CURL, ['-k', '-s', '-L', '-m', '25', '-A', UA, '-e', referer || (new URL(url).origin + '/'),
@@ -699,25 +711,6 @@ async function resolveStreamtapeMp4(embedUrl) {
   let m;
   while ((m = re.exec(page))) { const u = build(m[1], m[2], m[3]); if (u) return { url: u, referer: origin + '/' }; }
   return null;
-}
-
-// Resolve the get_video gate to its CDN URL so the client can stream it directly
-// instead of relaying every byte through us. get_video is IP-locked to the
-// requester (our server), but the tapecontent.net URL it 302-redirects to is
-// NOT — once resolved server-side it plays from any client IP with no Referer
-// (verified), at full CDN speed. Follow the redirect with a 2-byte range request
-// and return the final URL, or null to fall back to the /stream proxy.
-function resolveStreamtapeCdn(getVideoUrl, referer) {
-  return new Promise((resolve) => {
-    execFile(CURL, ['-k', '-s', '-L', '-m', '15', '-A', UA,
-      '-e', referer || (new URL(getVideoUrl).origin + '/'),
-      '-r', '0-1', '-o', NULLDEV, '-w', '%{url_effective}', getVideoUrl],
-      { maxBuffer: 1024 * 1024 }, (err, stdout) => {
-        if (err) return resolve(null);
-        const u = (stdout || '').trim();
-        resolve(/^https:/i.test(u) && u !== getVideoUrl ? u : null);
-      });
-  });
 }
 
 // sign a /stream target so the proxy only serves URLs we minted (no open proxy)
@@ -1740,9 +1733,34 @@ function playerjsInner(file, { subtitle = '', poster = '' } = {}) {
     opts.push(`subtitle:${safe(subtitle)}`);
     for (const [k, v] of Object.entries(PJS_SUB_STYLE)) opts.push(`${k}:${safe(v)}`);
   }
+  // Two captions fixes for "v2":
+  // 1) Playerjs registers the subtitle track but leaves it OFF behind a settings
+  //    submenu — useless on a TV remote, defeating the point of "v2". api(
+  //    'subtitle',0) turns the first (only) track on, but only takes once the
+  //    <video> is really playing (called before the proxied HLS manifest loads it
+  //    just sets the menu label, then no-ops), so we wait for playback to start
+  //    and enable exactly once.
+  // 2) In fullscreen, captions vanish on smart TVs: the native fullscreen button
+  //    fullscreens the bare <video>, dropping Playerjs's caption overlay (a DOM
+  //    sibling) off the top layer. When the <video> itself becomes the fullscreen
+  //    element we re-target fullscreen to the .player-box container (which holds
+  //    both the video and the captions and already has the :fullscreen CSS).
+  //    Refusal (desktop Firefox) is caught and harmless. Same trick as
+  //    initCaptions in iptv.js.
+  const enableSub = subtitle
+    ? `(function(){var done=false;function go(){if(done)return;done=true;try{pjsp.api('subtitle',0)}catch(e){}}` +
+      `var n=0,iv=setInterval(function(){var v=document.querySelector('#player video');` +
+      `if(v){clearInterval(iv);v.addEventListener('playing',go);` +
+      `v.addEventListener('timeupdate',function(){if(v.currentTime>0)go()})}else if(++n>60)clearInterval(iv)},200);` +
+      `function fsEl(){return document.fullscreenElement||document.webkitFullscreenElement||null}` +
+      `function onFs(){var v=document.querySelector('#player video');var b=v&&(v.closest('.player-box')||document.getElementById('player'));` +
+      `if(!v||!b||fsEl()!==v)return;var rq=b.requestFullscreen||b.webkitRequestFullscreen;if(!rq)return;` +
+      `try{var pr=rq.call(b);if(pr&&pr.catch)pr.catch(function(){})}catch(e){}}` +
+      `document.addEventListener('fullscreenchange',onFs);document.addEventListener('webkitfullscreenchange',onFs)})();`
+    : '';
   return `<div id="player" class="playerframe"></div>
     <script src="${asset('/playerjs.js')}"></script>
-    <script>new Playerjs({${opts.join(',')}});</script>`;
+    <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}</script>`;
 }
 
 app.get('/tv/play', (req, res) => {
@@ -1901,8 +1919,7 @@ app.get(['/tvproxy', '/tvproxy/:fname'], async (req, res) => {
       if (v) res.setHeader(h, v);
     }
     res.setHeader('Cache-Control', 'no-store');
-    if (!up.body) return res.end();
-    Readable.fromWeb(up.body).pipe(res);
+    streamUpstream(up, res);
   } catch (e) {
     res.status(502).end();
   }
@@ -1917,8 +1934,8 @@ app.get('/t/:type(filmas|serialai|movie|tv|tff|tfs)/:id', async (req, res) => {
   } catch (e) { errorPage(res, e, '/'); }
 });
 
-// Tagged logger for the ad-free playback path so it's easy to see, per play,
-// whether the client streams straight from the CDN or falls back to the proxy.
+// Tagged logger for the ad-free playback path so each play is easy to find in
+// the log (which source, proxied vs. embed, and any client-side fallback).
 function logAdfree(msg) { console.log(`[adfree ${new Date().toISOString()}] ${msg}`); }
 
 app.get('/play', async (req, res) => {
@@ -2006,20 +2023,20 @@ app.get('/play', async (req, res) => {
     if (stape && wantBypass) {
       const direct = await resolveStreamtapeMp4(src);
       if (direct) {
-        // The get_video gate is IP-locked to us, but the CDN URL it resolves to
-        // is not — hand that to the client so it streams straight from the CDN
-        // (full speed, no relay) instead of proxying every byte through us. Keep
-        // the /stream proxy as a fallback for clients the direct URL fails on.
-        const cdn = await resolveStreamtapeCdn(direct.url, direct.referer);
+        // Both the get_video gate and the tapecontent CDN URL it 302-redirects to
+        // are IP-locked to the resolver (us). Handing the CDN URL to the client (a
+        // different IP) now 403s — Streamtape used to leave the redirect target
+        // open to any IP, but no longer. So playback must go through /stream, which
+        // fetches from our allowed IP and relays the bytes.
         const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
         const proxied = `/stream?${sq.toString()}`;
-        logAdfree(`8filmai ${cdn ? 'DIRECT cdn' : 'PROXY (cdn resolve failed)'} — ${title}`);
+        logAdfree(`8filmai PROXY — ${title}`);
         // "v2" plays the same stream in the vendored Playerjs UI instead of a
         // bare <video> (handy for comparing players across sources)
         if (req.query.player === 'pjs') {
-          return res.send(playerShell(title, back, playerjsInner(cdn || streamFiles([{ url: direct.url }], direct.referer)), ''));
+          return res.send(playerShell(title, back, playerjsInner(streamFiles([{ url: direct.url }], direct.referer)), ''));
         }
-        return res.send(playerShell(title, back, mp4PlayerInner(cdn || proxied, cdn ? proxied : '')));
+        return res.send(playerShell(title, back, mp4PlayerInner(proxied)));
       }
       // extraction failed — fall through to the normal iframe with a note
     }
@@ -2106,8 +2123,7 @@ app.get(['/stream', '/stream/:fname'], async (req, res) => {
       const v = up.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-    if (!up.body) return res.end();
-    Readable.fromWeb(up.body).pipe(res);
+    streamUpstream(up, res);
   } catch (e) {
     res.status(502).end();
   }
