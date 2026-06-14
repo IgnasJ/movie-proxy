@@ -1664,6 +1664,20 @@ function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
     <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));` : ''}</script>`;
 }
 
+// Bare-<video> player for a direct (Referer-locked) MP4 served through /stream —
+// the ad-free Streamtape (8filmai) and TopFilmai streams. Carries the same
+// tap-to-play / error-retry overlays as the hls.js player: smart-TV browsers
+// block autoplay-with-sound until a gesture and expose no obvious controls, so a
+// bare autoplaying <video> just sits there "not buffering". preload=auto starts
+// the buffer immediately; initMp4 shows ▶ when play() is rejected (see iptv.js).
+function mp4PlayerInner(streamUrl) {
+  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline preload="auto" src="${esc(streamUrl)}"></video>
+    <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
+    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
+    <script src="${asset('/iptv.js')}"></script>
+    <script>initMp4(document.getElementById('tvvideo'));</script>`;
+}
+
 // Build a Playerjs `file` value from raw URLs, each routed through /stream so
 // Referer-locked CDNs keep serving: a single string for one file, or a
 // {title,file} playlist array for several. The "/v.mp4" segment is ignored by
@@ -1938,8 +1952,7 @@ app.get('/play', async (req, res) => {
       const r = await provider.play(req.query);
       if (r && r.mp4) {
         const sq = new URLSearchParams({ u: r.mp4, r: r.referer, s: streamSig(r.mp4, r.referer) });
-        return res.send(playerShell(title, back, `
-    <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
+        return res.send(playerShell(title, back, mp4PlayerInner(`/stream?${sq.toString()}`), ''));
       }
       if (r && r.site && r.files && r.files.length) {
         // the source's own Playerjs UI — playlist + next/prev for a series,
@@ -1969,8 +1982,7 @@ app.get('/play', async (req, res) => {
           return res.send(playerShell(title, back, playerjsInner(streamFiles([{ url: direct.url }], direct.referer)), ''));
         }
         const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
-        return res.send(playerShell(title, back, `
-    <video class="playerframe" controls autoplay playsinline src="/stream?${esc(sq.toString())}"></video>`, ''));
+        return res.send(playerShell(title, back, mp4PlayerInner(`/stream?${sq.toString()}`), ''));
       }
       // extraction failed — fall through to the normal iframe with a note
     }

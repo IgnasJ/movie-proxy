@@ -169,6 +169,31 @@ function initIptv(directUrl, proxyUrl, embedUrl) {
   start();
 }
 
+/* Direct-MP4 playback for the ad-free streams played in a bare <video> through
+   /stream (8filmai's Streamtape MP4, TopFilmai's MP4). Smart-TV browsers block
+   autoplay-with-sound until a user gesture and surface no obvious controls, so a
+   bare autoplaying <video> just sits there never buffering — "opens but doesn't
+   load". Mirror initIptv's resilience: drive playback with play() so the
+   autoplay rejection is caught and the ▶ tap overlay shown, and reveal the
+   error+retry overlay if the media fails to load. (preload=auto in the markup
+   fills the buffer immediately, even before playback starts.) */
+function initMp4(v) {
+  'use strict';
+  var tap = document.getElementById('tvtap');
+  var err = document.getElementById('tverr');
+  function tryPlay() {
+    var p = v.play();
+    if (p && p.catch) {
+      p.then(function () { if (tap) tap.hidden = true; })
+       .catch(function () { if (tap) tap.hidden = false; });
+    }
+  }
+  if (tap) tap.addEventListener('click', function () { tap.hidden = true; tryPlay(); });
+  v.addEventListener('loadedmetadata', tryPlay);
+  v.addEventListener('error', function () { if (err) err.hidden = false; });
+  tryPlay();
+}
+
 /* Subtitle rendering for the ad-free HLS player.
 
    Almost every browser — desktop Chrome/Firefox/Edge and iPhone/iPad Safari —
