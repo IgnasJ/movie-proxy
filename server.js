@@ -22,12 +22,23 @@ if (process.env.INSECURE_TLS === '1') {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 
-// Dispatcher that ignores TLS cert mismatches, used only for /tvproxy fetches —
-// stream CDNs are often on raw IPs with certs for another name. Scoped per
-// request (not global) so TMDB and the source site keep normal verification.
-let insecureAgent = null;
-try { insecureAgent = new (require('undici').Agent)({ connect: { rejectUnauthorized: false } }); }
-catch { /* undici not exposed — fall back to default fetch */ }
+// undici tuning for the proxy paths (P1). Default keep-alive is only 4s, so a
+// pause / seek after an idle gap forces a fresh TLS handshake to the CDN; hold
+// sockets open longer and pool generously so resumes and segment bursts reuse
+// warm connections. The global dispatcher keeps normal TLS verification (TMDB,
+// source, /stream); `insecureAgent` additionally ignores cert mismatches and is
+// used only for /tvproxy, whose CDNs sit on raw IPs with certs for another name.
+// `request` is undici's low-level API: it returns a native Node stream (no
+// web-stream wrapper) and follows redirects via maxRedirections — used by the
+// byte proxy so piping is cheaper per chunk.
+let request = null, insecureAgent = null;
+try {
+  const undici = require('undici');
+  request = undici.request;
+  const KA = { keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000, connections: 128 };
+  undici.setGlobalDispatcher(new undici.Agent(KA));
+  insecureAgent = new undici.Agent({ ...KA, connect: { rejectUnauthorized: false } });
+} catch { /* undici not exposed — fall back to default fetch */ }
 
 // Cache-busting for static assets: append the file's mtime so a changed
 // css/js gets a new URL and browsers fetch it instead of a stale cached copy
@@ -365,10 +376,42 @@ function rewriteM3U8(body, baseUrl, referer = '') {
 // pulling bytes we'll never send.
 function streamUpstream(up, res) {
   if (!up.body) return res.end();
-  const body = Readable.fromWeb(up.body);
+  pipeNode(Readable.fromWeb(up.body), res);
+}
+
+// Pipe a Node Readable to the client with the same abort-safety as above.
+function pipeNode(body, res) {
+  if (!body) return res.end();
   body.on('error', () => { try { res.destroy(); } catch { /* already gone */ } });
   res.on('close', () => { try { body.destroy(); } catch { /* already gone */ } });
   body.pipe(res);
+}
+
+// Open an upstream connection for BYTE proxying, returning a native Node stream
+// (P3). Prefers undici.request — its body is already a Node Readable, so we skip
+// the per-chunk Readable.fromWeb() conversion fetch() would need; falls back to
+// fetch where undici isn't exposed. `header(name)` reads a response header
+// (lowercase). Not for text endpoints (undici.request won't auto-decompress).
+async function openUpstream(url, { headers, hops = 5, insecure = false } = {}) {
+  if (request) {
+    // undici.request doesn't follow redirects on its own (and this version
+    // rejects the maxRedirections option), so chase them manually.
+    let cur = url;
+    for (let i = 0; ; i++) {
+      const r = await request(cur, { headers, dispatcher: insecure ? insecureAgent : undefined });
+      const loc = r.headers.location;
+      if (loc && r.statusCode >= 300 && r.statusCode < 400 && i < hops) {
+        r.body.resume();
+        cur = new URL(Array.isArray(loc) ? loc[0] : loc, cur).href;
+        continue;
+      }
+      return { status: r.statusCode, header: (h) => r.headers[h], body: r.body };
+    }
+  }
+  const opts = { headers, redirect: 'follow' };
+  if (insecure && insecureAgent) opts.dispatcher = insecureAgent;
+  const r = await fetch(url, opts);
+  return { status: r.status, header: (h) => r.headers.get(h), body: r.body ? Readable.fromWeb(r.body) : null };
 }
 
 function youtubeId(u) {
@@ -726,6 +769,40 @@ function streamSig(u, r) {
   return crypto.createHash('sha256').update(`${u}|${r}|${authToken}`).digest('hex').slice(0, 16);
 }
 
+// P4: Streamtape's get_video gate 302-redirects to a stable tapecontent CDN URL.
+// Following that redirect on EVERY range request costs an extra round-trip — and
+// iOS fires many small range requests. Resolve the gate to its CDN URL once and
+// cache it (bounded by the gate's own expires= timestamp), so /stream then hits
+// the CDN directly. Non-gate URLs (e.g. filmaito.top) pass straight through.
+const cdnCache = new Map();
+async function resolveCdn(u, r) {
+  if (!/\/get_video\?id=/.test(u)) return u;
+  const hit = cdnCache.get(u);
+  if (hit && hit.exp > Date.now()) return hit.url;
+  const headers = { 'User-Agent': UA, Referer: r || (new URL(u).origin + '/'), Range: 'bytes=0-0' };
+  let loc = null;
+  try {
+    if (request) {
+      const resp = await request(u, { method: 'GET', headers });   // doesn't follow -> we read the 302
+      resp.body.resume();
+      if (resp.statusCode >= 300 && resp.statusCode < 400) loc = resp.headers.location;
+    } else {
+      const resp = await fetch(u, { headers, redirect: 'manual' });
+      try { await resp.arrayBuffer(); } catch { /* drain */ }
+      if (resp.status >= 300 && resp.status < 400) loc = resp.headers.get('location');
+    }
+  } catch { /* fall back to the gate URL — /stream still follows redirects */ }
+  if (!loc) return u;
+  const resolved = new URL(Array.isArray(loc) ? loc[0] : loc, u).href;
+  const m = u.match(/[?&]expires=(\d+)/);
+  const exp = Math.min(m ? parseInt(m[1], 10) * 1000 : Infinity, Date.now() + 6 * 3600 * 1000);
+  if (exp > Date.now()) {
+    if (cdnCache.size > 300) for (const [k, v] of cdnCache) if (v.exp <= Date.now()) cdnCache.delete(k);
+    cdnCache.set(u, { url: resolved, exp });
+  }
+  return resolved;
+}
+
 /* --------------------------- MoviesAPI ad-free (HLS) -------------------------
    WatchLuna's "MoviesAPI" server (moviesapi.to) embeds the hd4u.sbs player,
    which wraps the stream in pop-up ads and an IMA pre-roll and refuses headless
@@ -775,12 +852,15 @@ async function resolveMoviesApiHls(kind, id, season, episode) {
     } catch { src = null; }
     if (!src || !/\.m3u8/i.test(src)) return null;
     try {
-      const opts = { headers: { 'User-Agent': UA, Referer: HD4U_REFERER, Accept: '*/*' }, redirect: 'follow' };
-      if (insecureAgent) opts.dispatcher = insecureAgent;
-      const probe = await fetch(src, opts);
-      try { await probe.arrayBuffer(); } catch { /* drain */ }
+      // P5: validate the master with a 1-byte range probe instead of downloading
+      // the whole playlist just to drain it — cuts a round-trip off first play.
+      const probe = await openUpstream(src, {
+        headers: { 'User-Agent': UA, Referer: HD4U_REFERER, Accept: '*/*', Range: 'bytes=0-0' },
+        insecure: true,
+      });
+      if (probe.body) probe.body.resume();              // discard the byte
       if (probe.status === 404) return null;            // not provisioned -> embed
-      if (probe.ok) return { m3u8: src, referer: HD4U_REFERER };
+      if (probe.status < 400) return { m3u8: src, referer: HD4U_REFERER };
     } catch { /* transient network blip — retry */ }
   }
   return null;
@@ -1934,7 +2014,11 @@ app.get(['/tvproxy', '/tvproxy/:fname'], async (req, res) => {
       const v = up.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-    res.setHeader('Cache-Control', 'no-store');
+    // P2: segments / keys / media are immutable for this signed URL (the token is
+    // in the URL, and live segment names are one-shot), so let the browser cache
+    // them — seeking back / replay won't re-hit us. Only the playlists above stay
+    // no-store, since those can change (live edge).
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
     streamUpstream(up, res);
   } catch (e) {
     res.status(502).end();
@@ -2133,13 +2217,25 @@ app.get(['/stream', '/stream/:fname'], async (req, res) => {
   try {
     const headers = { 'User-Agent': UA, 'Referer': r, 'Accept': '*/*' };
     if (req.headers.range) headers.Range = req.headers.range;
-    const up = await fetch(u, { headers });
+    // P4: hit the resolved CDN URL directly (skips the per-request get_video 302).
+    const target = await resolveCdn(u, r);
+    let up = await openUpstream(target, { headers });
+    // a cached CDN URL can expire mid-session -> re-resolve through the gate once.
+    if (up.status === 403 && target !== u) {
+      cdnCache.delete(u);
+      if (up.body) up.body.resume();
+      up = await openUpstream(u, { headers });
+    }
     res.status(up.status);
-    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']) {
-      const v = up.headers.get(h);
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+      const v = up.header(h);
       if (v) res.setHeader(h, v);
     }
-    streamUpstream(up, res);
+    // P2: the /stream URL embeds the expiring token, so its bytes are immutable
+    // for this URL — let the browser cache ranges so seeking back doesn't re-hit
+    // us (the CDN itself sends no Cache-Control).
+    res.setHeader('Cache-Control', 'private, max-age=21600');
+    pipeNode(up.body, res);
   } catch (e) {
     res.status(502).end();
   }
