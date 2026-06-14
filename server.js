@@ -114,9 +114,17 @@ app.get('/logout', (req, res) => {
   res.redirect('/login');
 });
 
-// everything below requires a session
+// everything below requires a session — except the proxy/media endpoints, which
+// are fetched by the player itself, not navigated to. iOS plays <video>/HLS in a
+// separate media process that does NOT send our cookie, so a cookie gate here
+// bounces those range/segment/subtitle requests to the login HTML and playback
+// silently never starts (works on desktop, which does send the cookie). These
+// don't need a session to be safe: /stream and /tvproxy carry an unguessable
+// HMAC signature (s=) so they're not an open proxy, and /sub only takes an imdb
+// id and relays public OpenSubtitles data. Each handler validates its own input.
+const PLAYER_ENDPOINTS = /^\/(stream|tvproxy|sub)(\/|$)/;
 app.use((req, res, next) => {
-  if (isAuthed(req)) return next();
+  if (isAuthed(req) || PLAYER_ENDPOINTS.test(req.path)) return next();
   res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));
 });
 
