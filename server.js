@@ -1327,8 +1327,12 @@ function detailPage(d, sourceName) {
     // Playerjs UI
     const adFreeBtn2 = af
       ? `<a class="btn srv adfree2" href="${esc(af + '&player=pjs')}">▶ Be reklamų v2</a>` : '';
+    // v3 (HLS only): native-HLS player, a smart-TV captions test (cues on the
+    // video plane survive Tizen fullscreen, where HTML overlays are hidden)
+    const adFreeBtn3 = (af && af.endsWith('&adfree=1'))
+      ? `<a class="btn srv adfree3" href="${esc(af + '&player=native')}">▶ Be reklamų v3 <small>TV titrai</small></a>` : '';
     sources = `<h2 class="section-title">Šaltiniai</h2>
-    <div class="srvlist">` + adFreeBtn + adFreeBtn2 + (d.servers || []).map(s => `
+    <div class="srvlist">` + adFreeBtn + adFreeBtn2 + adFreeBtn3 + (d.servers || []).map(s => `
       <a class="btn srv${s.isTrailer ? ' trailer' : ''}" href="${esc(s.play)}">
         ▶ ${esc(s.name || 'Serveris')}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}
       </a>`).join('') + sitePlayerBtn + `</div>`;
@@ -1346,10 +1350,13 @@ function detailPage(d, sourceName) {
       const adFreeBtn2 = af
         ? `<a class="btn srv adfree2" data-ep="${esc(ep.label)}" href="${esc(af + '&player=pjs')}">▶ Be reklamų v2</a>`
         : '';
+      const adFreeBtn3 = (af && af.endsWith('&adfree=1'))
+        ? `<a class="btn srv adfree3" data-ep="${esc(ep.label)}" href="${esc(af + '&player=native')}">▶ Be reklamų v3 <small>TV titrai</small></a>`
+        : '';
       return `
     <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
       <div class="ep-label">${esc(ep.label)}${epSeen ? ` <span class="eptick">✓</span>` : ''}</div>
-      <div class="ep-servers">` + adFreeBtn + adFreeBtn2 + ep.servers.map(s => `
+      <div class="ep-servers">` + adFreeBtn + adFreeBtn2 + adFreeBtn3 + ep.servers.map(s => `
         <a class="btn srv" data-ep="${esc(ep.label)}" href="${esc(s.play)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
       </div>
     </div>`;
@@ -1771,6 +1778,24 @@ function playerjsInner(file, { subtitle = '', poster = '' } = {}) {
     <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}</script>`;
 }
 
+// Native-HLS player (experimental, for the "v3" smart-TV captions test). Plays
+// the proxied m3u8 via the platform's OWN HLS support (video.src, no hls.js/MSE)
+// and shows the subtitle as a native <track>. The point: on Samsung Tizen the
+// fullscreen video is a hardware plane that hides HTML caption overlays (what
+// hls.js+initCaptions and Playerjs both use), but cues from a native track are
+// drawn by the video pipeline itself, so they survive fullscreen. `file` needs a
+// visible .m3u8 so native HLS detection kicks in; segments stay Referer-locked,
+// so it still goes through /tvproxy. Reuses initMp4's tap-to-play / error overlay.
+function nativeHlsPlayerInner(file, subTrack = '') {
+  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline preload="auto" src="${esc(file)}">${subTrack}</video>
+    <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
+    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
+    <script src="${asset('/iptv.js')}"></script>
+    <script>(function(){var v=document.getElementById('tvvideo');initMp4(v,'');
+      function subsOn(){try{for(var i=0;i<v.textTracks.length;i++)v.textTracks[i].mode='showing';}catch(e){}}
+      v.addEventListener('loadedmetadata',subsOn);v.addEventListener('playing',subsOn);subsOn();})();</script>`;
+}
+
 app.get('/tv/play', (req, res) => {
   const { channels } = loadIptv();
   const i = parseInt(req.query.c, 10);
@@ -1989,11 +2014,17 @@ app.get('/play', async (req, res) => {
           const subtitle = subSp ? `[${label}]/sub/s.vtt?${subSp.toString()}` : '';
           return res.send(playerShell(title, back, playerjsInner(file, { subtitle })));
         }
-        // default: our own hls.js player, subtitle as a native <track> rendered
-        // by initCaptions (with the smart-TV overlay fallback)
         const subTrack = subSp
           ? `<track kind="subtitles" srclang="${sub}" label="${esc(label)}" src="/sub?${esc(subSp.toString())}" default>`
           : '';
+        // "v3" (experimental, smart-TV captions test): native HLS + native <track>
+        // so cues are drawn on the video plane and survive Tizen fullscreen.
+        if (req.query.player === 'native') {
+          const file = proxied.replace('/tvproxy?', '/tvproxy/master.m3u8?');
+          return res.send(playerShell(title, back, nativeHlsPlayerInner(file, subTrack)));
+        }
+        // default: our own hls.js player, subtitle as a native <track> rendered
+        // by initCaptions (with the smart-TV overlay fallback)
         return res.send(playerShell(title, back, hlsPlayerInner('', proxied, '', subTrack)));
       }
       // extraction failed — fall through to the normal embed player
