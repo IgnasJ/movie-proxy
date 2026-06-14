@@ -520,6 +520,41 @@ button.chip.subs-pick.active { background: #1f7a33; color: #fff; }
 .tv-err[hidden] { display: none; }
 .tv-err a { color: #ffd66b; text-decoration: underline; }
 
+/* CSS-only "maximize" button + state for the captioned player (see initFakeFs).
+   Blows the player box up to fill the viewport WITHOUT native fullscreen, so the
+   video stays in the web layer and the caption overlay isn't hidden behind a
+   smart-TV hardware video plane. */
+.tv-fs {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  width: 2.6rem;
+  height: 2.6rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.tv-fs:focus { outline: 2px solid #e5a00d; outline-offset: 2px; }
+.player-box.fakefs {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  border-radius: 0;
+  aspect-ratio: auto;
+  z-index: 9999;
+}
+
 /* ad-free HLS player captions — we draw WebVTT cues into this overlay ourselves
    (see initCaptions in iptv.js) because smart-TV browsers don't paint <track>
    cues over hls.js/MSE video. Sits above the native control bar, ignores taps.

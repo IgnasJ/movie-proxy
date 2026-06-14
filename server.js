@@ -1684,12 +1684,20 @@ app.get('/tv', (req, res) => {
 // overlay only on smart TVs, which don't paint <track> cues over hls.js/MSE
 // video — see initCaptions in iptv.js.
 function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
+  // A CSS-only "maximize" button, shown only when there are captions: native
+  // fullscreen hands the <video> to a smart-TV hardware plane that's drawn above
+  // the web page, hiding our DOM caption overlay. Instead this just blows the
+  // player box up to fill the viewport while it stays in the page layer, so the
+  // captions ride along and stay visible. See initFakeFs in iptv.js.
+  const fsBtn = subTrack
+    ? `<button id="tvfs" class="tv-fs" aria-label="Visas ekranas" title="Visas ekranas">⛶</button>`
+    : '';
   return `<video id="tvvideo" class="playerframe" controls autoplay playsinline>${subTrack}</video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
-    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
+    <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>${fsBtn}
     <script src="${asset('/hls.min.js')}"></script>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));` : ''}</script>`;
+    <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));initFakeFs(document.getElementById('tvvideo'));` : ''}</script>`;
 }
 
 // Bare-<video> player for the ad-free MP4 streams. `src` is the URL the <video>

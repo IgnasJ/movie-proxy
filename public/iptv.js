@@ -222,6 +222,28 @@ function initMp4(v, fallback) {
   tryPlay();
 }
 
+/* CSS-only "maximize" for the captioned player (the #tvfs button). Native
+   fullscreen hands the <video> to a hardware plane that smart TVs composite
+   ABOVE the web page, so our DOM caption overlay vanishes in fullscreen. Instead
+   we toggle a class that blows the player box up to fill the viewport while it
+   stays in the normal page layer — the captions stay visible. Escape and the TV
+   remote Back key (keyCode 10009 on Tizen) exit. */
+function initFakeFs(video) {
+  'use strict';
+  var box = video.closest ? video.closest('.player-box') : null;
+  var btn = document.getElementById('tvfs');
+  if (!box || !btn) return;
+  function set(on) {
+    box.classList.toggle('fakefs', on);
+    btn.textContent = on ? '✕' : '⛶'; // ✕ when maximized, ⛶ otherwise
+  }
+  btn.addEventListener('click', function () { set(!box.classList.contains('fakefs')); });
+  document.addEventListener('keydown', function (e) {
+    var back = e.keyCode === 27 || e.keyCode === 10009 || e.key === 'Escape';
+    if (back && box.classList.contains('fakefs')) { e.preventDefault(); set(false); }
+  });
+}
+
 /* Subtitle rendering for the ad-free HLS player.
 
    Almost every browser — desktop Chrome/Firefox/Edge and iPhone/iPad Safari —
