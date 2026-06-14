@@ -177,10 +177,23 @@ function initIptv(directUrl, proxyUrl, embedUrl) {
    autoplay rejection is caught and the ▶ tap overlay shown, and reveal the
    error+retry overlay if the media fails to load. (preload=auto in the markup
    fills the buffer immediately, even before playback starts.) */
-function initMp4(v) {
+function initMp4(v, fallback) {
   'use strict';
   var tap = document.getElementById('tvtap');
   var err = document.getElementById('tverr');
+  var usedFallback = false;
+
+  // Report fallback/error to the server so they show up in its log, not just on
+  // this device. Best-effort: sendBeacon where available, an Image GET as a
+  // fallback for older TV browsers. Never throws into playback.
+  function report(ev) {
+    try {
+      var u = '/clientlog?ev=' + encodeURIComponent(ev) + '&t=' + encodeURIComponent(document.title || '');
+      if (navigator.sendBeacon) navigator.sendBeacon(u);
+      else new Image().src = u;
+    } catch (e) { /* logging is best-effort */ }
+  }
+
   function tryPlay() {
     var p = v.play();
     if (p && p.catch) {
@@ -188,9 +201,24 @@ function initMp4(v) {
        .catch(function () { if (tap) tap.hidden = false; });
     }
   }
+  // The primary src is the direct CDN URL (fast, no relay). If it fails to load
+  // — expired or blocked on this client — swap once to the /stream proxy
+  // fallback before surfacing the error overlay.
+  function onError() {
+    if (fallback && !usedFallback) {
+      usedFallback = true;
+      report('fallback-to-proxy');
+      v.src = fallback;
+      v.load();
+      tryPlay();
+      return;
+    }
+    report(usedFallback ? 'error-after-fallback' : 'error');
+    if (err) err.hidden = false;
+  }
   if (tap) tap.addEventListener('click', function () { tap.hidden = true; tryPlay(); });
   v.addEventListener('loadedmetadata', tryPlay);
-  v.addEventListener('error', function () { if (err) err.hidden = false; });
+  v.addEventListener('error', onError);
   tryPlay();
 }
 

@@ -659,6 +659,7 @@ function isStreamtapeHost(host) {
 // (post-redirect) URL after a marker so we can recover the real origin after any
 // mirror redirect.
 const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
+const NULLDEV = process.platform === 'win32' ? 'NUL' : '/dev/null';
 function curlFetch(url, referer) {
   return new Promise((resolve, reject) => {
     execFile(CURL, ['-k', '-s', '-L', '-m', '25', '-A', UA, '-e', referer || (new URL(url).origin + '/'),
@@ -698,6 +699,25 @@ async function resolveStreamtapeMp4(embedUrl) {
   let m;
   while ((m = re.exec(page))) { const u = build(m[1], m[2], m[3]); if (u) return { url: u, referer: origin + '/' }; }
   return null;
+}
+
+// Resolve the get_video gate to its CDN URL so the client can stream it directly
+// instead of relaying every byte through us. get_video is IP-locked to the
+// requester (our server), but the tapecontent.net URL it 302-redirects to is
+// NOT — once resolved server-side it plays from any client IP with no Referer
+// (verified), at full CDN speed. Follow the redirect with a 2-byte range request
+// and return the final URL, or null to fall back to the /stream proxy.
+function resolveStreamtapeCdn(getVideoUrl, referer) {
+  return new Promise((resolve) => {
+    execFile(CURL, ['-k', '-s', '-L', '-m', '15', '-A', UA,
+      '-e', referer || (new URL(getVideoUrl).origin + '/'),
+      '-r', '0-1', '-o', NULLDEV, '-w', '%{url_effective}', getVideoUrl],
+      { maxBuffer: 1024 * 1024 }, (err, stdout) => {
+        if (err) return resolve(null);
+        const u = (stdout || '').trim();
+        resolve(/^https:/i.test(u) && u !== getVideoUrl ? u : null);
+      });
+  });
 }
 
 // sign a /stream target so the proxy only serves URLs we minted (no open proxy)
@@ -1664,18 +1684,23 @@ function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
     <script>initIptv(${JSON.stringify(directUrl)}, ${JSON.stringify(proxyUrl)}, ${JSON.stringify(embedUrl)});${subTrack ? `initCaptions(document.getElementById('tvvideo'));` : ''}</script>`;
 }
 
-// Bare-<video> player for a direct (Referer-locked) MP4 served through /stream —
-// the ad-free Streamtape (8filmai) and TopFilmai streams. Carries the same
-// tap-to-play / error-retry overlays as the hls.js player: smart-TV browsers
-// block autoplay-with-sound until a gesture and expose no obvious controls, so a
-// bare autoplaying <video> just sits there "not buffering". preload=auto starts
-// the buffer immediately; initMp4 shows ▶ when play() is rejected (see iptv.js).
-function mp4PlayerInner(streamUrl) {
-  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline preload="auto" src="${esc(streamUrl)}"></video>
+// Bare-<video> player for the ad-free MP4 streams. `src` is the URL the <video>
+// loads — ideally a direct CDN URL (8filmai's Streamtape, resolved server-side
+// so the client streams straight from the CDN at full speed), otherwise the
+// /stream proxy (TopFilmai, whose CDN is Referer-locked and can't be handed to a
+// browser). `fallback`, when set, is a /stream proxy URL initMp4 swaps to if the
+// direct URL fails on this client. Carries the same tap-to-play / error-retry
+// overlays as the hls.js player: smart-TV browsers block autoplay-with-sound
+// until a gesture and expose no obvious controls, so a bare autoplaying <video>
+// just sits there "not buffering". preload=auto starts the buffer immediately;
+// initMp4 shows ▶ when play() is rejected (see iptv.js). referrerpolicy=
+// no-referrer because the CDN URL is verified to need no Referer.
+function mp4PlayerInner(src, fallback = '') {
+  return `<video id="tvvideo" class="playerframe" controls autoplay playsinline preload="auto" referrerpolicy="no-referrer" src="${esc(src)}"></video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initMp4(document.getElementById('tvvideo'));</script>`;
+    <script>initMp4(document.getElementById('tvvideo'), ${JSON.stringify(fallback || '')});</script>`;
 }
 
 // Build a Playerjs `file` value from raw URLs, each routed through /stream so
@@ -1892,6 +1917,10 @@ app.get('/t/:type(filmas|serialai|movie|tv|tff|tfs)/:id', async (req, res) => {
   } catch (e) { errorPage(res, e, '/'); }
 });
 
+// Tagged logger for the ad-free playback path so it's easy to see, per play,
+// whether the client streams straight from the CDN or falls back to the proxy.
+function logAdfree(msg) { console.log(`[adfree ${new Date().toISOString()}] ${msg}`); }
+
 app.get('/play', async (req, res) => {
   const source = (req.query.source || '').toString();
   const provider = SOURCES[source] && SOURCES[source].provider;
@@ -1952,6 +1981,7 @@ app.get('/play', async (req, res) => {
       const r = await provider.play(req.query);
       if (r && r.mp4) {
         const sq = new URLSearchParams({ u: r.mp4, r: r.referer, s: streamSig(r.mp4, r.referer) });
+        logAdfree(`topfilmai PROXY (CDN is referer-locked) — ${title}`);
         return res.send(playerShell(title, back, mp4PlayerInner(`/stream?${sq.toString()}`), ''));
       }
       if (r && r.site && r.files && r.files.length) {
@@ -1976,13 +2006,20 @@ app.get('/play', async (req, res) => {
     if (stape && wantBypass) {
       const direct = await resolveStreamtapeMp4(src);
       if (direct) {
-        // "v2" plays the same MP4 in the vendored Playerjs UI instead of a bare
-        // <video> (handy for testing that player against a non-TopFilmai source)
-        if (req.query.player === 'pjs') {
-          return res.send(playerShell(title, back, playerjsInner(streamFiles([{ url: direct.url }], direct.referer)), ''));
-        }
+        // The get_video gate is IP-locked to us, but the CDN URL it resolves to
+        // is not — hand that to the client so it streams straight from the CDN
+        // (full speed, no relay) instead of proxying every byte through us. Keep
+        // the /stream proxy as a fallback for clients the direct URL fails on.
+        const cdn = await resolveStreamtapeCdn(direct.url, direct.referer);
         const sq = new URLSearchParams({ u: direct.url, r: direct.referer, s: streamSig(direct.url, direct.referer) });
-        return res.send(playerShell(title, back, mp4PlayerInner(`/stream?${sq.toString()}`), ''));
+        const proxied = `/stream?${sq.toString()}`;
+        logAdfree(`8filmai ${cdn ? 'DIRECT cdn' : 'PROXY (cdn resolve failed)'} — ${title}`);
+        // "v2" plays the same stream in the vendored Playerjs UI instead of a
+        // bare <video> (handy for comparing players across sources)
+        if (req.query.player === 'pjs') {
+          return res.send(playerShell(title, back, playerjsInner(cdn || streamFiles([{ url: direct.url }], direct.referer)), ''));
+        }
+        return res.send(playerShell(title, back, mp4PlayerInner(cdn || proxied, cdn ? proxied : '')));
       }
       // extraction failed — fall through to the normal iframe with a note
     }
@@ -1996,6 +2033,18 @@ app.get('/play', async (req, res) => {
     res.send(playerShell(title, back, `
     <iframe class="playerframe" src="${esc(src)}" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>`, bypassBtn, note));
   } catch (e) { errorPage(res, e, back); }
+});
+
+// Client beacons here when the ad-free player swaps from the direct CDN URL to
+// the /stream proxy, or errors out — so fallbacks surface in the server log
+// instead of only on the device. Best-effort; returns 204 and never blocks
+// playback. (sendBeacon POSTs, the Image() fallback GETs — accept both.)
+app.all('/clientlog', (req, res) => {
+  const ev = (req.query.ev || '').toString().slice(0, 40);
+  const t = (req.query.t || '').toString().slice(0, 120);
+  const ua = (req.headers['user-agent'] || '').toString().slice(0, 140);
+  logAdfree(`client: ${ev} — ${t} [${ua}]`);
+  res.status(204).end();
 });
 
 function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
