@@ -444,6 +444,23 @@ const RU_MONTHS = {
 function parseEpgHtml(html) {
   const $ = cheerio.load(html);
   const programs = [];
+  // Current layout (Nov 2026): one <div class="epg-day" data-d="YYYY-MM-DD">
+  // per day, each holding <li><span class="t">HH:MM</span><details>
+  // <summary>title</summary><p>desc</p></details></li>.
+  $('.epg-day[data-d]').each((_, day) => {
+    const date = $(day).attr('data-d');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+    $(day).find('li').each((__, li) => {
+      const time = $(li).find('.t').first().text().trim();
+      const $det = $(li).find('details').first();
+      const title = ($det.find('summary').first().text() || $det.text()).trim();
+      if (!/^\d{1,2}:\d{2}$/.test(time) || !title) return;
+      const desc = $det.find('p').first().text().trim();
+      programs.push({ start: `${date}T${time.padStart(5, '0')}`, title, desc: desc.slice(0, 400) });
+    });
+  });
+  if (programs.length) return programs;
+  // older layout: <h3>date</h3> + section.panel .prog_id blocks
   $('section.panel').each((_, sec) => {
     const head = $(sec).prevAll('h3').first().text().trim();
     const m = head.match(/(\d{1,2})\s+([а-яё]+)\s+(\d{4})/i);
@@ -1930,7 +1947,33 @@ function playerjsInner(file, { subtitle = '', poster = '', playlistToFirst = fal
     <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}${playlistInit}</script>`;
 }
 
-app.get('/tv/play', (req, res) => {
+// Is this HLS channel FairPlay-encrypted right now? (Go3 keeps TV3/TV6 under
+// SAMPLE-AES.) Checked server-side so devices without hls.js — iPad/Safari, TVs
+// playing HLS natively — also get the licensed embed straight away instead of
+// a black screen. Looks at the first variant's media playlist; cached briefly
+// because the DRM can be switched on and off.
+const drmCache = new Map();
+async function hlsIsFairPlay(url) {
+  const hit = drmCache.get(url);
+  if (hit && hit.exp > Date.now()) return hit.v;
+  let v = false;
+  try {
+    const get = async (u) => {
+      const r = await fetch(u, { headers: { 'User-Agent': UA }, redirect: 'follow', signal: AbortSignal.timeout(5000) });
+      return { url: r.url || u, body: r.ok ? await r.text() : '' };
+    };
+    let pl = await get(url);
+    if (/#EXT-X-STREAM-INF/.test(pl.body)) {
+      const variant = pl.body.split(/\r?\n/).find(l => l && !l.startsWith('#'));
+      if (variant) pl = await get(new URL(variant.trim(), pl.url).href);
+    }
+    v = /KEYFORMAT="com\.apple\.streamingkeydelivery"|METHOD=SAMPLE-AES/i.test(pl.body);
+  } catch { /* unknown: let the client-side detection decide */ }
+  drmCache.set(url, { v, exp: Date.now() + 2 * 60 * 1000 });
+  return v;
+}
+
+app.get('/tv/play', async (req, res) => {
   const { channels } = loadIptv();
   const i = parseInt(req.query.c, 10);
   const c = channels[i];
@@ -1945,10 +1988,19 @@ app.get('/tv/play', (req, res) => {
     const label = dir < 0 ? `${arrow} ${name}` : `${name} ${arrow}`;
     return `<a class="btn alt zap" href="/tv/play?c=${j}" title="${esc(ch.name)}">${label}</a>`;
   };
-  const buttons = zap(i - 1, -1) + zap(i + 1, 1);
+  // Go3 also locks its embed off-platform ("Programa nepasiekiama dėl licencijų
+  // apribojimų"), so for play.tv3.lt channels offer the channel on TV3's own
+  // site, where it plays legally with their DRM player.
+  const embedSrc = c.embed || iframeSrcOf(c.url) || '';
+  const tv3 = embedSrc.match(/^https:\/\/play\.tv3\.lt\/embed-video\/([\w-]+,live-\d+)/);
+  const onSite = tv3
+    ? `<a class="btn alt" href="https://play.tv3.lt/lives/${esc(tv3[1])}" target="_blank" rel="noopener">Žiūrėti play.tv3.lt ↗</a>`
+    : '';
+  const buttons = zap(i - 1, -1) + onSite + zap(i + 1, 1);
 
   const yt = youtubeId(c.url);
-  const ifr = yt ? null : iframeSrcOf(c.url);
+  const ifr = yt ? null
+    : iframeSrcOf(c.url) || (c.embed && await hlsIsFairPlay(c.url) ? c.embed : null);
   const inner = yt
     ? `<iframe class="playerframe" src="https://www.youtube-nocookie.com/embed/${esc(yt)}?autoplay=1&playsinline=1" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe>`
     : ifr
