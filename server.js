@@ -1106,10 +1106,26 @@ const WL = {
 // expiring token, so they're re-resolved from the (cached) detail page at click
 // time rather than baked into the catalog.
 
-// The CDN's Referer allowlist accepts this and the source IP, but NOT the
-// topfilmai.org domain (it 403s) — so we pin a constant independent of the
-// front-end host instead of deriving it from TOPFILMAI.
-const TF_STREAM_REFERER = 'https://filmaito.top/';
+// Referer the relay sends to the CDN: the origin of the site that issued the
+// link, which is what a browser playing the film on that site sends. It has to
+// match the issuing site (a 45.12.2.7 Referer with a link from here gets 500).
+const TF_STREAM_REFERER = TOPFILMAI + '/';
+
+// The filmaito.top CDN serves the full file only to a request shaped like a
+// browser's <video> fetch from the source site; anything else gets a ~30 s
+// "watch in the browser" clip under the same 206 (so check the size/duration,
+// not the status). These are the headers Chrome sends for that media request.
+// Used with the site owner's permission (per the project owner, 2026-11).
+function isTfCdn(u) {
+  try { return /(^|\.)filmaito\.top$/i.test(new URL(u).hostname); } catch { return false; }
+}
+const TF_MEDIA_HEADERS = {
+  'Accept-Encoding': 'identity',
+  'Accept-Language': 'lt-LT,lt;q=0.9,en;q=0.8',
+  'Sec-Fetch-Dest': 'video',
+  'Sec-Fetch-Mode': 'no-cors',
+  'Sec-Fetch-Site': 'cross-site',
+};
 
 async function tfGet(slug, ttlMs = 5 * 60 * 1000, fresh = false) {
   const url = slug.startsWith('http') ? slug : TOPFILMAI + (slug.startsWith('/') ? slug : '/' + slug);
@@ -1885,12 +1901,15 @@ function hlsPlayerInner(directUrl, proxyUrl, embedUrl = '', subTrack = '') {
 // just sits there "not buffering". preload=auto starts the buffer immediately;
 // initMp4 shows ▶ when play() is rejected (see iptv.js). referrerpolicy=
 // no-referrer because the CDN URL is verified to need no Referer.
-function mp4PlayerInner(src, fallback = '') {
+// `minDuration` (seconds): a clip shorter than this is treated as a failed load
+// — TopFilmai's CDN answers non-browser clients with a ~10 s "watch in the
+// browser" decoy instead of an error.
+function mp4PlayerInner(src, fallback = '', minDuration = 0) {
   return `<video id="tvvideo" class="playerframe" controls autoplay playsinline preload="auto" referrerpolicy="no-referrer" src="${esc(src)}"></video>
     <button id="tvtap" class="tv-tap" hidden aria-label="Paleisti">▶</button>
     <div id="tverr" class="tv-err" hidden>Nepavyko paleisti. <a href="">Bandyti dar kartą</a></div>
     <script src="${asset('/iptv.js')}"></script>
-    <script>initMp4(document.getElementById('tvvideo'), ${JSON.stringify(fallback || '')});</script>`;
+    <script>initMp4(document.getElementById('tvvideo'), ${JSON.stringify(fallback || '')}, ${Number(minDuration) || 0});</script>`;
 }
 
 // Build a Playerjs `file` value from raw URLs, each routed through /stream so
@@ -2255,8 +2274,19 @@ app.get('/play', async (req, res) => {
       const r = await provider.play(req.query);
       if (r && r.mp4) {
         const sq = new URLSearchParams({ u: r.mp4, r: r.referer, s: streamSig(r.mp4, r.referer) });
-        logAdfree(`topfilmai PROXY (CDN is referer-locked) — ${title}`);
-        return res.send(playerShell(title, back, mp4PlayerInner(`/stream?${sq.toString()}`), ''));
+        // Direct-first: the viewer's own browser fetches the MP4 from the CDN,
+        // /stream is only the fallback. The CDN hands non-browser clients (our
+        // relay) a ~30 s "watch in the browser" decoy instead of the film, so a
+        // too-short clip counts as a failure (minDuration) and shows the error
+        // overlay rather than the decoy. Verified 2026-11: series episodes play
+        // direct; tokenised movie files are refused off-site (and decoyed via
+        // the relay), so movies currently end in the error overlay.
+        // The CDN rejects a foreign Referer but accepts none. <video> ignores
+        // the referrerpolicy attribute (media requests follow the document
+        // policy), so the policy is set for the whole page.
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        logAdfree(`topfilmai DIRECT (fallback: /stream proxy) — ${title}`);
+        return res.send(playerShell(title, back, mp4PlayerInner(r.mp4, `/stream?${sq.toString()}`, 120), ''));
       }
       if (r && r.site && r.files && r.files.length) {
         // the source's own Playerjs UI — playlist + next/prev for a series,
@@ -2376,7 +2406,11 @@ app.get(['/stream', '/stream/:fname'], async (req, res) => {
   if (!u || s !== streamSig(u, r)) return res.status(403).end();
   try {
     const headers = { 'User-Agent': UA, 'Referer': r, 'Accept': '*/*' };
+    const tfCdn = isTfCdn(u);
+    if (tfCdn) Object.assign(headers, TF_MEDIA_HEADERS);
+    // a browser's media request always carries a Range; mirror that for the CDN
     if (req.headers.range) headers.Range = req.headers.range;
+    else if (tfCdn) headers.Range = 'bytes=0-';
     // P4: hit the resolved CDN URL directly (skips the per-request get_video 302).
     const target = await resolveCdn(u, r);
     let up = await openUpstream(target, { headers });

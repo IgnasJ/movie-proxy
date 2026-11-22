@@ -177,7 +177,7 @@ function initIptv(directUrl, proxyUrl, embedUrl) {
    autoplay rejection is caught and the ▶ tap overlay shown, and reveal the
    error+retry overlay if the media fails to load. (preload=auto in the markup
    fills the buffer immediately, even before playback starts.) */
-function initMp4(v, fallback) {
+function initMp4(v, fallback, minDuration) {
   'use strict';
   var tap = document.getElementById('tvtap');
   var err = document.getElementById('tverr');
@@ -217,7 +217,16 @@ function initMp4(v, fallback) {
     if (err) err.hidden = false;
   }
   if (tap) tap.addEventListener('click', function () { tap.hidden = true; tryPlay(); });
-  v.addEventListener('loadedmetadata', tryPlay);
+  // A clip far shorter than a film/episode is the CDN's "watch in the browser"
+  // decoy, served instead of an error — treat it exactly like a failed load.
+  v.addEventListener('loadedmetadata', function () {
+    if (minDuration && isFinite(v.duration) && v.duration < minDuration) {
+      report('decoy-clip');
+      v.pause();
+      return onError();
+    }
+    tryPlay();
+  });
   v.addEventListener('error', onError);
   tryPlay();
 }
