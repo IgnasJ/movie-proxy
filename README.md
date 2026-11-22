@@ -16,7 +16,8 @@ All three expose the same UI (home, browse, search, detail, playback) through a 
 
 - **Login page**: a proper styled form (not the browser's Basic Auth popup). A session cookie keeps you logged in for a year, so the TV isn't re-prompted; an "Atsijungti" link logs out. Credentials come from `.env`.
 - **Source selection** screen (`/sources`) right after login.
-- **Front page** shows the source's popular/newest movies and series as separate sections.
+- **Front page** is a set of horizontally scrolling shelves: **Tęsti žiūrėti** (continue watching), **Mano sąrašas** (wishlist), then the source's popular/newest movies and series, each with a **Visi ›** link to the full catalogue page. On a remote, left/right walks a shelf and up/down jumps between shelves.
+- **Continue watching (cross-device)**: every play is remembered per title in `data/progress.json` (override with `PROGRESS_FILE`). Our own `<video>` players report the position every 15 s, so the card shows a progress bar and the time left, and opening it resumes where it stopped. Embed players can't report a position, so their cards are plain shortcuts. A finished film is removed; a finished episode stays as "Baigta" and leads to the series page. Records expire after 45 days; **Išvalyti** clears the shelf.
 - **Search bar** queries the active source.
 - **Browse pages** `/filmai` and `/serialai` with pagination.
 - **Detail pages** show poster, original title, year, rating, runtime, language, genres and description (8filmai also shows cast).
@@ -26,14 +27,16 @@ All three expose the same UI (home, browse, search, detail, playback) through a 
 - **Subtitles (LT/EN)**: on WatchLuna a subtitle picker on the detail page offers EN and — when OpenSubtitles has them for that IMDb id — LT; the choice is passed to the embed player as `ds_lang`. In the ad-free HLS player the chosen track is fetched as WebVTT through `/sub` and rendered natively, with a custom on-video caption overlay for smart-TV browsers that won't paint `<track>` cues over hls.js.
 - **Watched tracking (cross-device)**: opening a real stream provider automatically marks that title as watched (series also record the specific episode; trailers don't count). Watched items get a ✓ badge on every card/search result, plus per-episode ticks on series. State is stored **server-side** in `data/watched.json`, so all devices that use the same server share it — no manual marking, no per-device state. Override the path with the `WATCHED_FILE` env var.
 - **Wishlist (“Mano sąrašas”, `/sarasas`)**: a **+ Į sąrašą** button on any detail page saves the title; the list page groups saved items by source and by film/series. Like watched state it's stored **server-side** (`data/wishlist.json`, override with `WISHLIST_FILE`), so every device sharing the server sees the same list.
-- **TV remote navigation**: arrow keys move focus spatially with a big yellow focus ring; the remote's Back button goes back. Works with mouse/touch on iPad too.
+- **TV remote navigation**: arrow keys move focus spatially with a big yellow focus ring; the remote's Back button goes back. Coming back from a film or the player puts the focus on the card or button that was opened (`public/tv.js`). Works with mouse/touch on iPad too.
+- **Remote keys in the player** (`public/player.js`, our own `<video>` only): the focus starts on the picture, so ←/→ seek 10 s (growing to 30 s and 60 s while repeated), OK/Space toggles pause, ↑ reaches the button bar. The remote's Play/Pause/Stop/FF/RW keys work wherever the focus is, and Channel ±/PageUp/PageDown zap channels on live TV. Each key shows a short on-screen readout.
+- **Series**: a **▶ Tęsti: N serija** button opens the episode after the last watched one; lists longer than 60 episodes are split into ranges of 50 with the "next up" range opened first. The player gets a **Kita: … ›** button, and when an episode ends in our own `<video>` a 10 s countdown starts the next one (Back cancels).
 - **Live TV (`/tv`)**: IPTV channels from a `data/iptv.m3u` playlist — edit it straight in the hosting file manager, changes apply on the next page load (no restart). Channels are grouped by `group-title` and numbered; the player has prev/next channel buttons.
 
 ## Live TV / IPTV
 
 - **Playlist**: standard M3U (`#EXTINF` with `tvg-id`, `tvg-name`, `tvg-logo`, `group-title`, an optional `tvg-embed`, then the URL). The runtime file is `data/iptv.m3u`; path override via the `IPTV_FILE` env var.
 - **EPG (program guide)**: the player shows a live schedule sidebar on the right. Each channel's `tvg-id` is used as an [iptvx.one](https://epg.iptvx.one) slug — the server scrapes `https://epg.iptvx.one/id/<tvg-id>` (cached ~30 min) and `/tv/epg?id=<slug>` returns it as JSON; the sidebar highlights what's on now and lists upcoming programmes. Leave `tvg-id=""` for a channel with no guide. Times are treated as Vilnius-local (matches an iPad/TV in Lithuania).
-- **Encoded default + live editing**: the repo ships only `iptv.iptv` — a base64-encoded default (so plaintext stream URLs aren't committed). On first run the app decodes it into `data/iptv.m3u`. After that the runtime file is **never overwritten**, so you can edit `data/iptv.m3u` directly in the hosting file manager and your changes survive restarts and redeploys. To force a re-seed, delete `data/iptv.m3u`.
+- **Encoded default, regenerated on start**: the repo ships only `iptv.iptv` — a base64-encoded default (so plaintext stream URLs aren't committed). On **every start** the app decodes it into `data/iptv.m3u`, so a deploy always ships the current channel list. You can still edit `data/iptv.m3u` in the hosting file manager (applies on the next page load), but that edit lasts only until the next restart — the edited copy is then saved as `data/iptv.m3u.bak` and replaced. To make a change permanent, put it in `iptv.iptv`. The `/tv` page has a **download button** (`/tv/playlist.m3u`) for the whole playlist.
   - Update the baked-in default: edit the local plaintext master `iptv.m3u` (gitignored), run `npm run encode-iptv` (writes `iptv.iptv`), commit `iptv.iptv`.
   - Inspect the encoded file any time: `npm run decode-iptv` (prints the m3u to stdout). The decoder also accepts a plaintext `iptv.iptv`, so hand-editing it works too.
 - **Playback**: HLS streams play in a plain HTML5 `<video>` — hls.js where MediaSource is available (Chrome/Firefox/TV browsers), native HLS on iPhone/iPad Safari. Direct mp4/mp3 also work.
@@ -63,15 +66,16 @@ npm start          # http://localhost:3000  (login: admin / pass)
 | `INSECURE_TLS` | unset                    | Set `1` only if a source's TLS cert breaks       |
 | `WATCHED_FILE` | `./data/watched.json`    | Where watched state is stored (JSON file)        |
 | `WISHLIST_FILE`| `./data/wishlist.json`   | Where the wishlist is stored (JSON file)         |
-| `IPTV_FILE`    | `./data/iptv.m3u`        | Runtime Live TV playlist (seeded from `iptv.iptv`, editable in hosting) |
-| `IPTV_DEFAULT` | `./iptv.iptv`            | Encoded default playlist, decoded on first run   |
+| `PROGRESS_FILE`| `./data/progress.json`   | Where "continue watching" positions are stored   |
+| `IPTV_FILE`    | `./data/iptv.m3u`        | Runtime Live TV playlist (regenerated from `iptv.iptv` on every start) |
+| `IPTV_DEFAULT` | `./iptv.iptv`            | Encoded default playlist, decoded on every start |
 
 > Note: after changing `AUTH_PASS`, devices that stored the old auth cookie will be asked to log in again.
 
 ## Deploy on Hostinger (Node.js hosting)
 
 1. Upload the project (or connect via Git): `package.json`, `server.js`, `iptv-codec.js`, `iptv.iptv`, `public/`, `.env`.
-   Do **not** upload `node_modules` — Hostinger runs `npm install` itself. On first start the app decodes `iptv.iptv` into `data/iptv.m3u`; edit that file later in the file manager without redeploying.
+   Do **not** upload `node_modules` — Hostinger runs `npm install` itself. On every start the app decodes `iptv.iptv` into `data/iptv.m3u`.
 2. Framework/backend: **Express**. Node version: 18, 20, 22 or 24 — all work.
 3. Start command: `npm start` (entry file `server.js`).
 4. Set environment variables in the Hostinger panel (or keep the `.env` file): at minimum `AUTH_USER` and `AUTH_PASS`, plus `TMDB_API_KEY` if you want the WatchLuna source.

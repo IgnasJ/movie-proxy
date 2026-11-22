@@ -260,6 +260,83 @@ function toggleWishlist(key, { title, poster, kind, rating } = {}) {
   return true;
 }
 
+/* ------------------------- progress store (shared, on disk) ------------------
+   "Tęsti žiūrėti": the last thing played per title, plus the position our own
+   <video> players report (public/player.js). One record per title, keyed like
+   the watched store — opening another episode replaces it. Embed players can't
+   report a position, so their records carry pos 0 and act as plain shortcuts.
+   A finished film is removed; a finished episode stays as "done" (the card then
+   leads to the series page, which offers the next episode). Stale records
+   expire. */
+
+const PROGRESS_FILE = process.env.PROGRESS_FILE || path.join(__dirname, 'data', 'progress.json');
+const PROGRESS_TTL = 45 * 24 * 3600 * 1000;
+let progress = {};
+try {
+  progress = JSON.parse(fs.readFileSync(PROGRESS_FILE, 'utf8')) || {};
+} catch { /* first run — no file yet */ }
+
+let pgSaveTimer = null;
+function persistProgress() {
+  if (pgSaveTimer) return;
+  pgSaveTimer = setTimeout(() => {
+    pgSaveTimer = null;
+    try {
+      fs.mkdirSync(path.dirname(PROGRESS_FILE), { recursive: true });
+      const tmp = PROGRESS_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(progress));
+      fs.renameSync(tmp, PROGRESS_FILE);
+    } catch (e) { console.error('progress persist failed:', e.message); }
+  }, 2000);
+}
+
+// poster by detail key, remembered when a detail page is rendered: /play only
+// knows the title, and the "continue" card needs a picture
+const posterMemo = new Map();
+function rememberPoster(key, poster) {
+  if (!key || !poster) return;
+  posterMemo.delete(key);
+  posterMemo.set(key, poster);
+  if (posterMemo.size > 400) posterMemo.delete(posterMemo.keys().next().value);
+}
+
+// What a /play link is "about": the title (detail key) and the exact film or
+// episode (pid) — the same whichever server or player variant was picked.
+function playIdent(q) {
+  const key = watchedKey((q.back || '').toString());
+  const pid = ['source', 'id', 'kind', 'epi', 'season', 'episode']
+    .map(k => (q[k] || '').toString()).join('|');
+  return { key, pid };
+}
+
+function noteProgress(q, url, { title, kind, ep } = {}) {
+  const { key, pid } = playIdent(q);
+  if (!key) return;
+  const old = progress[key];
+  const same = old && old.pid === pid && !old.done;
+  progress[key] = {
+    pid, title: title || (old && old.title) || '', kind, ep: ep || '', play: url,
+    poster: posterMemo.get(key) || (old && old.poster) || (wishlist[key] && wishlist[key].poster) || '',
+    pos: same ? old.pos || 0 : 0,
+    dur: same ? old.dur || 0 : 0,
+    t: Date.now(),
+  };
+  persistProgress();
+}
+
+function continueItems(limit = 12) {
+  const now = Date.now();
+  let dirty = false;
+  for (const k of Object.keys(progress)) {
+    if (now - (progress[k].t || 0) > PROGRESS_TTL) { delete progress[k]; dirty = true; }
+  }
+  if (dirty) persistProgress();
+  return Object.entries(progress)
+    .sort((a, b) => (b[1].t || 0) - (a[1].t || 0))
+    .slice(0, limit)
+    .map(([key, r]) => ({ key, ...r }));
+}
+
 /* ------------------------------- IPTV (live TV) ------------------------------
    Channels come from a plain m3u file next to the app (iptv.m3u) so it can be
    edited straight in the hosting file manager — changes are picked up on the
@@ -1461,10 +1538,9 @@ ${body}
 </html>`;
 }
 
-function cardGrid(items) {
-  return `<div class="grid">` + items.map(i => {
-    const seen = !!watched[watchedKey(i.url)];
-    return `
+function cardHtml(i) {
+  const seen = !!watched[watchedKey(i.url)];
+  return `
   <a class="card${seen ? ' is-watched' : ''}" href="${esc(i.url)}">
     <div class="poster">
       <img loading="lazy" src="${esc(i.poster)}" alt="${esc(i.title)}">
@@ -1475,7 +1551,58 @@ function cardGrid(items) {
     </div>
     <div class="card-title">${esc(i.title)}</div>
   </a>`;
+}
+
+function cardGrid(items) {
+  return `<div class="grid">` + items.map(cardHtml).join('') + `</div>`;
+}
+
+// one horizontally scrolling shelf — on a TV, left/right walks the shelf and
+// up/down jumps between shelves, so the home page needs far fewer key presses
+function cardRow(items) {
+  return `<div class="row">` + items.map(cardHtml).join('') + `</div>`;
+}
+
+// "Tęsti žiūrėti" shelf: straight back into the player where it was left off
+function continueRow() {
+  const items = continueItems();
+  if (!items.length) return '';
+  const left = (s) => {
+    const m = Math.max(1, Math.round(s / 60));
+    return m >= 60 ? `${Math.floor(m / 60)} val. ${m % 60} min` : `${m} min`;
+  };
+  return `
+    <h2 class="section-title">Tęsti žiūrėti
+      <form class="inline-form" method="post" action="/progress/clear"><button type="submit" class="more">Išvalyti</button></form>
+    </h2>
+    <div class="row">` + items.map(r => {
+    const pct = r.dur > 0 ? Math.min(100, Math.round((r.pos / r.dur) * 100)) : 0;
+    const sub = r.done
+      ? `Baigta: ${r.ep}`
+      : [r.ep, r.dur > 0 && r.pos > 0 ? `liko ${left(r.dur - r.pos)}` : ''].filter(Boolean).join(' · ');
+    return `
+  <a class="card cont" href="${esc(r.done ? encodeURI(r.key) : r.play)}">
+    <div class="poster">
+      ${r.poster ? `<img loading="lazy" src="${esc(r.poster)}" alt="">` : `<div class="poster-ph">▶</div>`}
+      ${r.kind === 'serialai' ? `<span class="badge kind">Serialas</span>` : ''}
+      ${pct ? `<span class="progress"><i style="width:${pct}%"></i></span>` : ''}
+    </div>
+    <div class="card-title">${esc(r.title || '')}</div>
+    ${sub ? `<div class="card-sub">${esc(sub)}</div>` : ''}
+  </a>`;
   }).join('') + `</div>`;
+}
+
+// "Mano sąrašas" shelf on the home page (newest first)
+function wishlistRow(limit = 12) {
+  const items = Object.entries(wishlist)
+    .sort((a, b) => (b[1].t || 0) - (a[1].t || 0))
+    .slice(0, limit)
+    .map(([key, w]) => ({ url: encodeURI(key), title: w.title || '', poster: w.poster || '', rating: w.rating, kind: w.kind }));
+  if (!items.length) return '';
+  return `
+    <h2 class="section-title">Mano sąrašas <a class="more" href="/sarasas">Visi ›</a></h2>
+    ${cardRow(items)}`;
 }
 
 // the ad-free play URL for a server list, or null if no ad-free-capable server.
@@ -1530,9 +1657,41 @@ function detailPage(d, sourceName) {
       </a>`).join('') + sitePlayerBtn + `</div>`;
     if (!(d.servers || []).length) sources += `<p class="empty">Šaltinių nerasta.</p>`;
   } else {
-    sources = `<h2 class="section-title">Epizodai</h2>`
-      + (sitePlayerBtn ? `<div class="srvlist">${sitePlayerBtn}</div>` : '')
-      + (d.episodes || []).map(ep => {
+    const eps = d.episodes || [];
+    // "Next up" follows viewing order; some sources list the newest episode
+    // first, so the direction is read off the episode numbers in the labels.
+    const epNum = (l) => { const m = String(l).match(/\d+/g); return m ? parseInt(m[m.length - 1], 10) : NaN; };
+    const newestFirst = eps.length > 1 && epNum(eps[0].label) > epNum(eps[eps.length - 1].label);
+    const viewOrder = (i) => (newestFirst ? eps.length - 1 - i : i);
+    let lastSeen = -1;
+    eps.forEach((ep, i) => { if (seenEps.includes(ep.label)) lastSeen = Math.max(lastSeen, viewOrder(i)); });
+    const nextOrder = lastSeen >= 0 && lastSeen + 1 < eps.length ? lastSeen + 1 : -1;
+    const nextIdx = nextOrder < 0 ? -1 : (newestFirst ? eps.length - 1 - nextOrder : nextOrder);
+    const firstHref = (ep) => adFreeHref(ep.servers) || (ep.servers[0] && ep.servers[0].play) || '';
+    const resumeBtn = nextIdx >= 0 && firstHref(eps[nextIdx])
+      ? `<a class="btn srv resume" data-epi="${nextIdx}" href="${esc(firstHref(eps[nextIdx]))}">▶ Tęsti: ${esc(eps[nextIdx].label)}</a>`
+      : '';
+
+    // Long series are split into ranges of EP_GROUP so the list isn't hundreds
+    // of rows deep on a remote; the range holding "next up" opens first.
+    const EP_GROUP = 50;
+    const ranges = [];
+    for (let i = 0; i < eps.length; i += EP_GROUP) ranges.push([i, Math.min(i + EP_GROUP, eps.length)]);
+    const split = eps.length > 60;
+    // open on "next up"; if everything is watched, on the last watched one
+    const openIdx = nextIdx >= 0 ? nextIdx
+      : lastSeen >= 0 ? (newestFirst ? eps.length - 1 - lastSeen : lastSeen) : 0;
+    const activeRange = split ? Math.floor(openIdx / EP_GROUP) : 0;
+    const rangeLabel = ([a, b]) => {
+      const x = epNum(eps[a].label), y = epNum(eps[b - 1].label);
+      return Number.isNaN(x) || Number.isNaN(y) ? `${a + 1}–${b}` : `${x}–${y}`;
+    };
+    const rangeTabs = split
+      ? `<div class="ep-ranges">` + ranges.map((r, gi) =>
+        `<button type="button" class="chip ep-range${gi === activeRange ? ' active' : ''}" data-g="${gi}">${rangeLabel(r)}</button>`).join('') + `</div>`
+      : '';
+
+    const epHtml = eps.map((ep, epIdx) => {
       const epSeen = seenEps.includes(ep.label);
       // ad-free shortcut per episode (Streamtape MP4 or MoviesAPI HLS)
       const af = adFreeHref(ep.servers);
@@ -1543,14 +1702,19 @@ function detailPage(d, sourceName) {
         ? `<a class="btn srv adfree2" data-ep="${esc(ep.label)}" href="${esc(af + '&player=pjs')}">▶ Be reklamų v2</a>`
         : '';
       return `
-    <div class="episode${epSeen ? ' is-watched' : ''}" data-ep="${esc(ep.label)}">
+    <div class="episode${epSeen ? ' is-watched' : ''}${epIdx === nextIdx ? ' is-next' : ''}" data-ep="${esc(ep.label)}">
       <div class="ep-label">${esc(ep.label)}${epSeen ? ` <span class="eptick">✓</span>` : ''}</div>
       <div class="ep-servers">` + adFreeBtn + adFreeBtn2 + ep.servers.map(s => `
         <a class="btn srv" data-ep="${esc(ep.label)}" href="${esc(s.play)}">▶ ${esc(s.name)}${s.tag ? ` <small>${esc(s.tag)}</small>` : ''}</a>`).join('') + `
       </div>
     </div>`;
-    }).join('');
-    if (!(d.episodes || []).length) sources += `<p class="empty">Epizodų nerasta.</p>`;
+    });
+    sources = `<h2 class="section-title">Epizodai <small class="count">${eps.length}</small></h2>`
+      + (resumeBtn || sitePlayerBtn ? `<div class="srvlist ep-top">${resumeBtn}${sitePlayerBtn}</div>` : '')
+      + rangeTabs
+      + ranges.map(([a, b], gi) =>
+        `<div class="ep-group" data-g="${gi}"${split && gi !== activeRange ? ' hidden' : ''}>${epHtml.slice(a, b).join('')}</div>`).join('');
+    if (!eps.length) sources += `<p class="empty">Epizodų nerasta.</p>`;
   }
 
   const body = `
@@ -1693,9 +1857,15 @@ app.get('/', async (req, res) => {
   if (!id) return res.redirect('/sources');
   try {
     const sections = await SOURCES[id].provider.home();
-    const body = sections.map(s => `
-      <h2 class="section-title">${esc(s.title)}</h2>
-      ${cardGrid(s.items)}`).join('');
+    // shelves: continue watching, my list, then the source's own sections —
+    // each with a link to the full catalogue page where one exists
+    const moreLink = (t) => /serial/i.test(t) ? '/serialai' : /film/i.test(t) ? '/filmai' : '';
+    const body = continueRow() + wishlistRow() + sections.map(s => {
+      const more = moreLink(s.title);
+      return `
+      <h2 class="section-title">${esc(s.title)}${more ? ` <a class="more" href="${more}">Visi ›</a>` : ''}</h2>
+      ${cardRow(s.items)}`;
+    }).join('');
     res.send(layout('Filmai ir serialai', body, { active: 'home', source: SOURCES[id].name }));
   } catch (e) { errorPage(res, e); }
 });
@@ -2206,6 +2376,7 @@ app.get('/t/:type(filmas|serialai|movie|tv|tff|tfs)/:id', async (req, res) => {
   const provider = PROVIDER_BY_TYPE[type];
   try {
     const d = await provider.detail(type, id);
+    rememberPoster(watchedKey(d.backUrl), d.poster);
     res.send(detailPage(d, SOURCE_BY_PROVIDER(provider.id).name));
   } catch (e) { errorPage(res, e, '/'); }
 });
@@ -2213,6 +2384,39 @@ app.get('/t/:type(filmas|serialai|movie|tv|tff|tfs)/:id', async (req, res) => {
 // Tagged logger for the ad-free playback path so each play is easy to find in
 // the log (which source, proxied vs. embed, and any client-side fallback).
 function logAdfree(msg) { console.log(`[adfree ${new Date().toISOString()}] ${msg}`); }
+
+// Playback position for "Tęsti žiūrėti". player.js calls these with the play
+// page's own query string, so the server works out which title/episode it is.
+app.get('/progress/get', (req, res) => {
+  const { key, pid } = playIdent(req.query);
+  const r = key && progress[key];
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(r && r.pid === pid && !r.done ? { pos: r.pos || 0, dur: r.dur || 0 } : { pos: 0, dur: 0 });
+});
+
+app.post('/progress', (req, res) => {
+  const { key, pid } = playIdent(req.query);
+  const r = key && progress[key];
+  const pos = Math.floor(Number((req.body || {}).pos));
+  const dur = Math.floor(Number((req.body || {}).dur));
+  if (r && r.pid === pid && pos >= 0 && dur > 0 && pos <= dur + 5) {
+    // within the last minute (or 5 %) counts as finished
+    if (pos >= dur - Math.max(60, dur * 0.05)) {
+      if (r.kind === 'serialai') { r.done = true; r.pos = 0; r.t = Date.now(); }
+      else delete progress[key];
+    } else {
+      r.pos = pos; r.dur = dur; r.done = false; r.t = Date.now();
+    }
+    persistProgress();
+  }
+  res.status(204).end();
+});
+
+app.post('/progress/clear', (req, res) => {
+  progress = {};
+  persistProgress();
+  res.redirect('/');
+});
 
 app.get('/play', async (req, res) => {
   const source = (req.query.source || '').toString();
@@ -2225,11 +2429,13 @@ app.get('/play', async (req, res) => {
   const key = watchedKey(back);
   if (key && req.query.nume !== 'trailer') {
     const ep = (req.query.ep || '').toString();
-    markWatched(key, {
+    const rec = {
       title: title.split(' – ')[0],
       kind: /^\/t\/(serialai|tv|tfs)\//.test(key) ? 'serialai' : 'filmas',
       ep: ep || undefined,
-    });
+    };
+    markWatched(key, rec);
+    noteProgress(req.query, req.originalUrl, rec);   // "Tęsti žiūrėti"
   }
 
   try {
@@ -2391,6 +2597,7 @@ function playerShell(title, back, inner, extraBtn = '', note = '', epg = '') {
 ${note}
 ${stage}
 <script src="${asset('/tv.js')}"></script>
+<script src="${asset('/player.js')}"></script>
 </body>
 </html>`;
 }

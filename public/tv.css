@@ -639,3 +639,95 @@ video::cue {
   .btn.zap { padding: 0.5rem 0.7rem; }
   .zap-name { max-width: 4rem; }
 }
+
+/* /tv toolbar (playlist download) */
+.tv-tools { display: flex; justify-content: flex-end; margin: 0 0 4px; }
+
+/* ---- home shelves: one horizontally scrolling row per section ---- */
+.row {
+  display: flex;
+  gap: 1.1rem;
+  overflow-x: auto;
+  /* room for the focus ring + scale, which overflow would otherwise clip */
+  padding: 10px 8px 14px;
+  margin: 0 -8px;
+  scroll-padding: 0 2rem;
+  -webkit-overflow-scrolling: touch;
+}
+.row .card { flex: 0 0 160px; width: 160px; }
+.section-title .more,
+.section-title .inline-form .more {
+  float: right;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #b8bac2;
+  background: none;
+  border: 0;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+  text-decoration: none;
+  font-family: inherit;
+}
+.section-title .inline-form { display: inline; }
+.section-title .more:focus { color: #fff; }
+
+/* "Tęsti žiūrėti" cards */
+.card .progress {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.25);
+}
+.card .progress i { display: block; height: 100%; background: #e5a00d; }
+.card-sub { font-size: 0.85rem; color: #b8bac2; margin-top: 0.15rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.poster-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 2.5rem; color: #5a5e6b; }
+
+/* ---- series page: continue button, episode ranges, next-up marker ---- */
+.srvlist.ep-top { margin-bottom: 0.9rem; }
+.btn.srv.resume { background: #e5a00d; color: #14151a; font-size: 1.1rem; padding: 0.7rem 1.3rem; }
+.ep-ranges { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 0.9rem; }
+.ep-range { cursor: pointer; border: 0; font-family: inherit; font-size: 0.95rem; }
+.ep-range.active { background: #e5a00d; color: #14151a; font-weight: 700; }
+.episode.is-next { box-shadow: inset 4px 0 0 #e5a00d; background: #1c2029; }
+
+/* ---- player: remote-key readout, next-episode prompt ---- */
+.player-box:focus { outline: none; }
+.tv-osd {
+  position: absolute;
+  left: 50%;
+  bottom: 14%;
+  transform: translateX(-50%);
+  min-width: 46%;
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  border-radius: 10px;
+  padding: 0.7rem 1.1rem 0.8rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+  text-align: center;
+  white-space: pre;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+  z-index: 5;
+}
+.tv-osd.show { opacity: 1; }
+.tv-osd-bar { height: 5px; margin-top: 0.55rem; background: rgba(255, 255, 255, 0.25); border-radius: 3px; overflow: hidden; }
+.tv-osd-bar i { display: block; height: 100%; background: #e5a00d; }
+.tv-next {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.2rem;
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  text-align: center;
+  padding: 1rem;
+  z-index: 6;
+}
+.tv-next-title { font-size: 1.5rem; font-weight: 700; }
+.tv-next-btns { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+.btn.nextep { white-space: nowrap; }
