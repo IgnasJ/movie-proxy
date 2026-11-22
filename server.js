@@ -1070,10 +1070,10 @@ const WL = {
 // front-end host instead of deriving it from TOPFILMAI.
 const TF_STREAM_REFERER = 'https://filmaito.top/';
 
-async function tfGet(slug, ttlMs = 5 * 60 * 1000) {
+async function tfGet(slug, ttlMs = 5 * 60 * 1000, fresh = false) {
   const url = slug.startsWith('http') ? slug : TOPFILMAI + (slug.startsWith('/') ? slug : '/' + slug);
   const key = 'tf:' + url;
-  const hit = cache.get(key);
+  const hit = !fresh && cache.get(key);
   if (hit && hit.exp > Date.now()) return hit.html;
   const res = await fetch(url, {
     headers: { 'User-Agent': UA, 'Referer': TOPFILMAI + '/', 'Accept-Language': 'lt,en;q=0.8' },
@@ -1139,7 +1139,7 @@ function tfParseCards($, scope) {
 // playlist of {title,file} episodes (series, listed newest-first by the site).
 // The series array is tried first because its objects also contain a quoted
 // "file": key that the movie regex would otherwise match.
-function tfPlaylist(html) {
+function tfPlaylistInline(html) {
   const arr = html.match(/file\s*:\s*(\[[\s\S]*?\])/);
   if (arr) {
     try {
@@ -1149,6 +1149,65 @@ function tfPlaylist(html) {
   }
   const m = html.match(/file\s*:\s*["']([^"']+\.mp4[^"']*)["']/i);
   return m ? { kind: 'movie', file: m[1] } : null;
+}
+
+// Since Nov 2026 the page no longer inlines the Playerjs file: it calls
+//   rdPlayer("player", "<type>", "<id>", "<issued.hmac key>", "<poster>")
+// and rd-player.js fetches /engine/modules/rd-link.php?id=&t=&k= after load,
+// which returns {file: "<mp4>"} (movie), {file: [{title,file}…]} (series) or
+// {raw: "<js object list>"}. The key is signed with its issue time and goes
+// stale (403 {"error":"key"}), so on failure the caller re-fetches the page.
+function tfRdArgs(html) {
+  const m = html.match(/rdPlayer\(\s*["'][^"']*["']\s*,\s*["']([^"']*)["']\s*,\s*["']([^"']*)["']\s*,\s*["']([^"']*)["']/);
+  return m ? { type: m[1], id: m[2], key: m[3] } : null;
+}
+
+// rd-link.php answers 403 {"error":"site"} to a full browser User-Agent
+// without the page's session, but serves a bare "Mozilla/5.0" — so try that
+// first and the full UA only as a fallback.
+const TF_RD_UAS = ['Mozilla/5.0', UA];
+
+async function tfRdLink({ type, id, key }) {
+  const url = `${TOPFILMAI}/engine/modules/rd-link.php?id=${enc(id)}&t=${enc(type)}&k=${enc(key)}&_=${Date.now()}`;
+  let d = null;
+  for (const ua of TF_RD_UAS) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': ua, 'Referer': TOPFILMAI + '/', 'Accept': 'application/json' },
+      });
+      const j = await res.json().catch(() => null);
+      if (res.ok && j && (j.file || j.raw !== undefined)) { d = j; break; }
+      if (j && j.error === 'key') return null;   // stale key: caller refreshes the page
+    } catch { /* network error: try the next UA */ }
+  }
+  if (!d) return null;
+  let file = d && d.file;
+  if (d && typeof d.raw === 'string') {
+    try { file = JSON.parse('[' + d.raw.replace(/,\s*$/, '') + ']'); } catch { file = null; }
+  }
+  if (Array.isArray(file)) {
+    const list = file.filter(x => x && x.file);
+    return list.length ? { kind: 'series', list } : null;
+  }
+  return typeof file === 'string' && file ? { kind: 'movie', file } : null;
+}
+
+// Resolves the playlist for a detail page: inline Playerjs (old layout) or the
+// rd-link.php lookup (current layout), retrying once with a fresh page when
+// the cached page's key has expired. Returns { pl, html } — html may be newer.
+async function tfPlaylist(id) {
+  let html = await tfGet('/' + id);
+  const inline = tfPlaylistInline(html);
+  if (inline) return { pl: inline, html };
+  let args = tfRdArgs(html);
+  if (!args) return { pl: null, html };
+  let pl = await tfRdLink(args);
+  if (!pl) {
+    html = await tfGet('/' + id, undefined, true);   // bypass cache: fresh key
+    args = tfRdArgs(html);
+    if (args) pl = await tfRdLink(args);
+  }
+  return { pl, html };
 }
 
 function tfTrailer(html) {
@@ -1208,12 +1267,11 @@ const TF = {
     }));
   },
   async detail(type, id) {
-    const html = await tfGet('/' + id);
+    const { pl, html } = await tfPlaylist(id);
     const d = tfParseDetail(html);
     if (!d.title) throw new Error('Nepavyko perskaityti puslapio (gal pasikeitė šaltinio struktūra?)');
     const backUrl = `/t/${type}/${enc(id)}`;
     d.backUrl = backUrl;
-    const pl = tfPlaylist(html);
     const trailerId = tfTrailer(html);
 
     if (pl && pl.kind === 'series') {
@@ -1256,8 +1314,7 @@ const TF = {
       if (!yt) throw new Error('Nėra anonso');
       return { embed: `https://www.youtube.com/embed/${enc(yt)}?autoplay=1` };
     }
-    const html = await tfGet('/' + id);
-    const pl = tfPlaylist(html);
+    const { pl, html } = await tfPlaylist(id);
     if (!pl) throw new Error('Nepavyko rasti vaizdo nuorodos');
 
     // The site's own player: hand Playerjs the whole playlist (a single file for
