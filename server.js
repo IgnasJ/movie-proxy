@@ -269,21 +269,29 @@ function toggleWishlist(key, { title, poster, kind, rating } = {}) {
    page (mixed content), hosts without CORS headers (hls.js needs them), and
    Referer-locked CDNs. */
 
-// Runtime playlist lives in data/ so it can be edited live in hosting. It's
-// seeded once from the encoded default (iptv.iptv) — see seedIptv() — and then
-// never overwritten, so edits survive restarts and redeploys.
+// Runtime playlist lives in data/. It's regenerated from the encoded default
+// (iptv.iptv) on every start — see seedIptv() — so a deploy always ships the
+// current channel list. Live edits in hosting work until the next restart; to
+// make one permanent, put it in iptv.iptv (npm run encode-iptv).
 const IPTV_FILE = process.env.IPTV_FILE || path.join(__dirname, 'data', 'iptv.m3u');
 const IPTV_DEFAULT = process.env.IPTV_DEFAULT || path.join(__dirname, 'iptv.iptv');
 
-// Decode the bundled default into data/iptv.m3u on first run only. Delete
-// data/iptv.m3u (or set it via IPTV_FILE) to force a re-seed from iptv.iptv.
+// Decode the bundled default into data/iptv.m3u on every start. If the runtime
+// file was edited by hand (differs from the default), the old copy is kept as
+// iptv.m3u.bak before it's replaced, so a live edit is never silently lost.
 function seedIptv() {
   try {
-    if (fs.existsSync(IPTV_FILE) || !fs.existsSync(IPTV_DEFAULT)) return;
+    if (!fs.existsSync(IPTV_DEFAULT)) return;
     const { decode } = require('./iptv-codec');
+    const fresh = decode(fs.readFileSync(IPTV_DEFAULT, 'utf8'));
+    let current = null;
+    try { current = fs.readFileSync(IPTV_FILE, 'utf8'); } catch { /* not there yet */ }
+    if (current === fresh) return;
     fs.mkdirSync(path.dirname(IPTV_FILE), { recursive: true });
-    fs.writeFileSync(IPTV_FILE, decode(fs.readFileSync(IPTV_DEFAULT, 'utf8')));
-    console.log(`iptv: seeded ${IPTV_FILE} from ${path.basename(IPTV_DEFAULT)}`);
+    if (current !== null) fs.writeFileSync(IPTV_FILE + '.bak', current);
+    fs.writeFileSync(IPTV_FILE, fresh);
+    console.log(`iptv: ${current === null ? 'seeded' : 'regenerated'} ${IPTV_FILE} from ${path.basename(IPTV_DEFAULT)}`
+      + (current !== null ? ' (previous copy kept as .bak)' : ''));
   } catch (e) { console.error('iptv seed failed:', e.message); }
 }
 seedIptv();
@@ -429,9 +437,11 @@ function iframeSrcOf(u) {
 /* ------------------------------- EPG (iptvx.one) -----------------------------
    The channel's tvg-id is an iptvx.one slug; we scrape its program page
    (https://epg.iptvx.one/id/<slug>) into a flat list of {start,title,desc}.
-   Times on that page are Vilnius-local, which is what the TV/iPad shows, so we
-   return them as naive local datetimes and let the client pick "now". Cached
-   per slug; the source itself only refreshes about hourly. */
+   Times on that page are Moscow time (fixed UTC+3, no DST) — equal to Vilnius
+   in summer but an hour ahead in winter — so each start is converted to
+   Vilnius-local (epgToVilnius). We return naive local datetimes, which is what
+   the TV/iPad shows, and let the client pick "now". Cached per slug; the
+   source itself only refreshes about hourly. */
 
 const EPG_BASE = 'https://epg.iptvx.one/id/';
 const EPG_TTL = 30 * 60 * 1000;
@@ -440,6 +450,20 @@ const RU_MONTHS = {
   'января': '01', 'февраля': '02', 'марта': '03', 'апреля': '04', 'мая': '05', 'июня': '06',
   'июля': '07', 'августа': '08', 'сентября': '09', 'октября': '10', 'ноября': '11', 'декабря': '12',
 };
+
+// naive "YYYY-MM-DDTHH:MM" in the source's UTC+3 -> the same instant as a naive
+// Europe/Vilnius datetime (DST-aware: -1 h in winter, unchanged in summer)
+const EPG_SOURCE_UTC_OFFSET_H = 3;
+const vilniusFmt = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Europe/Vilnius', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false,
+});
+function epgToVilnius(naive) {
+  const m = naive.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!m) return naive;
+  const utc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - EPG_SOURCE_UTC_OFFSET_H, +m[5]);
+  return vilniusFmt.format(new Date(utc)).replace(' ', 'T');
+}
 
 function parseEpgHtml(html) {
   const $ = cheerio.load(html);
@@ -456,7 +480,7 @@ function parseEpgHtml(html) {
       const title = ($det.find('summary').first().text() || $det.text()).trim();
       if (!/^\d{1,2}:\d{2}$/.test(time) || !title) return;
       const desc = $det.find('p').first().text().trim();
-      programs.push({ start: `${date}T${time.padStart(5, '0')}`, title, desc: desc.slice(0, 400) });
+      programs.push({ start: epgToVilnius(`${date}T${time.padStart(5, '0')}`), title, desc: desc.slice(0, 400) });
     });
   });
   if (programs.length) return programs;
@@ -471,7 +495,7 @@ function parseEpgHtml(html) {
       const title = $(p).find('.prog_title').text().trim();
       if (!/^\d{1,2}:\d{2}$/.test(time) || !title) return;
       const desc = $(p).nextAll('.prog_desc').first().text().trim();
-      programs.push({ start: `${date}T${time.padStart(5, '0')}`, title, desc: desc.slice(0, 400) });
+      programs.push({ start: epgToVilnius(`${date}T${time.padStart(5, '0')}`), title, desc: desc.slice(0, 400) });
     });
   });
   return programs;
@@ -1817,7 +1841,8 @@ app.get('/tv', (req, res) => {
         <p>Nepavyko sukurti <code>${esc(IPTV_FILE)}</code>. Patikrink, ar yra <code>${esc(IPTV_DEFAULT)}</code>, arba įkelk kanalų sąrašą rankiniu būdu.</p>
       </div>`, opts));
   }
-  const body = (groups.map(g => `
+  const download = `<p class="tv-tools"><a class="btn alt" href="/tv/playlist.m3u" download="iptv.m3u">⬇ Atsisiųsti grojaraštį (.m3u)</a></p>`;
+  const body = download + (groups.map(g => `
     <h2 class="section-title">${esc(g.name)} <small class="count">${g.channels.length}</small></h2>
     <div class="chgrid">${g.channels.map(channelTile).join('')}</div>`).join('')
     || `<p class="empty">Kanalų sąrašas tuščias — papildyk iptv.m3u failą.</p>`)
@@ -1946,6 +1971,15 @@ function playerjsInner(file, { subtitle = '', poster = '', playlistToFirst = fal
     <script src="${asset('/playerjs.js')}"></script>
     <script>var pjsp=new Playerjs({${opts.join(',')}});${enableSub}${playlistInit}</script>`;
 }
+
+// the whole runtime playlist as a file, for VLC / an IPTV app / a backup
+app.get('/tv/playlist.m3u', (req, res) => {
+  if (!fs.existsSync(IPTV_FILE)) return res.status(404).send('Kanalų failas nerastas');
+  res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="iptv.m3u"');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(fs.readFileSync(IPTV_FILE, 'utf8'));
+});
 
 // Is this HLS channel FairPlay-encrypted right now? (Go3 keeps TV3/TV6 under
 // SAMPLE-AES.) Checked server-side so devices without hls.js — iPad/Safari, TVs
